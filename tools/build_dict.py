@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-Build the on-device dictionary from WordNet.
+Build the on-device dictionary from WordNet (format v3).
 
 Source : WordNet via nltk (auto-downloaded on first run).
-Output : data/dict.dat          (all words, shared by all tiers)
-         data/dict_full.idx     (Full  — all words)
-         data/dict_teen.idx     (Teen  — excludes offensive)
-         data/dict_mild.idx     (Mild  — excludes offensive + adult)
-         data/dict_safe.idx     (Safe  — excludes offensive + adult + mild)
-         data/ is PlatformIO's filesystem-image source; flash with `pio run -t uploadfs`.
+Output : data/dict.idx    (single index; entry includes wordMinTier)
+         data/dict.dat    (all words with per-meaning tierRange)
 
-Tier filtering is driven by three curated category word lists under tools/:
-  words_offensive.txt  — strong profanity + slurs (excluded from Teen, Mild, Safe)
-  words_adult.txt      — sexual / explicit        (excluded from Mild, Safe)
-  words_mild.txt       — naughty / slightly rude  (excluded from Safe only)
+Tier constants (SAFE=0, MILD=1, TEEN=2, FULL=3):
+  - wordMinTier = min(minTier) over all meanings; written in the index.
+  - tierRange   = minTier | (maxTier<<2); written per-meaning in dat.
+  - A meaning is visible iff minTier <= activeTier <= maxTier.
 
-Format (little-endian, matches the ESP32-S3) -- version 2:
+Auto tier floors are driven by four curated word lists under tools/:
+  words_offensive.txt  — strong profanity + slurs  → headword floor FULL
+  words_adult.txt      — explicit sexual content    → headword floor TEEN
+  words_mild.txt       — mild swears / toilet humour → headword floor MILD
+  core_harmful.txt     — tokens unacceptable inside a definition gloss
 
-  *.idx
-    "DIDX" | u32 version(2) | u32 count | count x [ u32 dataOffset ][ term ][ 0x00 ]
-    terms are lowercase a-z, sorted ascending (matches device strcmp binary search)
+Optional input files (tools/, TSV, skipped gracefully if absent):
+  sense_labels.tsv     word<TAB>def_prefix<TAB>minTierName
+  overrides.tsv        word<TAB>def_prefix<TAB>sanitised_def[<TAB>sanitised_ex]
 
-  dict.dat (shared; all tier indexes point into the same records)
+Format v3 (little-endian, matches firmware):
+
+  data/dict.idx
+    "DIDX" | u32 version=3 | u32 count
+    per entry: [u32 dataOffset][u8 wordMinTier][term ascii][0x00]
+    terms lowercase a-z, sorted ascending.
+
+  data/dict.dat
     per entry at dataOffset:
       u8 nMeanings
-      nMeanings x [ u8 posCode ][ u16 defLen ][ def ][ u16 exLen ][ example ]
+      nMeanings x [u8 tierRange][u8 posCode][u16 defLen][def][u16 exLen][example]
+    tierRange = minTier | (maxTier<<2)  (each 2 bits, 0..3)
     posCode: 0 noun, 1 verb, 2 adjective, 3 adverb, 4 other
 """
 
@@ -36,15 +44,22 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(os.path.dirname(HERE), "data")
 
-VERSION = 2
+VERSION = 3
 SENSE_CAP = int(os.environ.get("DICT_SENSE_CAP", "8"))  # max meanings per word (size lever)
 MAX_DEF = 240
 MAX_EX = 160
 POSMAP = {"n": 0, "v": 1, "a": 2, "s": 2, "r": 3}
 
+# Tier constants.
+SAFE = 0
+MILD = 1
+TEEN = 2
+FULL = 3
+TIER_NAMES = {"safe": SAFE, "mild": MILD, "teen": TEEN, "full": FULL}
 
-def load_blocklist(name):
-    """Load a word category list (one word per line, # comments skipped)."""
+
+def load_wordlist(name):
+    """Load a word list file (one word per line, # comments skipped). Returns a set."""
     path = os.path.join(HERE, name)
     out = set()
     if os.path.exists(path):
@@ -56,7 +71,22 @@ def load_blocklist(name):
     return out
 
 
+def load_tsv(name):
+    """Load a TSV file. Returns list of rows (each a list of stripped strings), skips # lines."""
+    path = os.path.join(HERE, name)
+    rows = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                rows.append([c.strip() for c in line.split("\t")])
+    return rows
+
+
 def get_wordnet():
+    """Return the WordNet corpus handle, downloading if needed."""
     import nltk
     try:
         from nltk.corpus import wordnet as wn
@@ -69,24 +99,64 @@ def get_wordnet():
     return wn
 
 
-def meanings_for(word, wn):
-    """Return [(posCode, def, example), ...] freq-ordered, capped, or []."""
+def headword_floor(word, offensive, adult, mild_list):
+    """Return the tier floor imposed by which category lists the headword appears in."""
+    if word in offensive:
+        return FULL
+    if word in adult:
+        return TEEN
+    if word in mild_list:
+        return MILD
+    return SAFE
+
+
+def core_gloss_floor(text, offensive, gloss_core):
+    """
+    Return the tier floor implied by harmful tokens appearing in a definition/example.
+    gloss_core = core_harmful minus {retard, retards, retarded}.
+    Each token in (text_tokens & gloss_core) contributes FULL if it is offensive, else TEEN.
+    """
+    tokens = set(re.findall(r"[a-z]+", text.lower()))
+    found = tokens & gloss_core
+    if not found:
+        return SAFE
+    result = SAFE
+    for tok in found:
+        result = max(result, FULL if tok in offensive else TEEN)
+    return result
+
+
+def meanings_for(word, wn, offensive, adult, mild_list, gloss_core):
+    """
+    Return [(posCode, definition, example, minTier, maxTier), ...] freq-ordered, capped.
+    minTier = max(headword_floor, core_gloss_floor(def + " " + ex)).
+    maxTier = FULL for all WordNet-sourced meanings.
+    """
+    hw_floor = headword_floor(word, offensive, adult, mild_list)
+
     scored = []
     for idx, syn in enumerate(wn.synsets(word)):
         count = max([l.count() for l in syn.lemmas() if l.name().lower() == word] or [0])
         scored.append((-count, idx, syn))
     scored.sort()
+
     out = []
     for _, _, syn in scored[:SENSE_CAP]:
         definition = (syn.definition() or "").strip()
         if not definition:
             continue
         example = (syn.examples()[:1] or [""])[0].strip()
-        out.append((POSMAP.get(syn.pos(), 4), definition[:MAX_DEF], example[:MAX_EX]))
+        def_trunc = definition[:MAX_DEF]
+        ex_trunc = example[:MAX_EX]
+
+        gloss_floor = core_gloss_floor(def_trunc + " " + ex_trunc, offensive, gloss_core)
+        min_tier = max(hw_floor, gloss_floor)
+        out.append((POSMAP.get(syn.pos(), 4), def_trunc, ex_trunc, min_tier, FULL))
     return out
 
 
 def collect_lemmas(wn):
+    """Return the set of all single-word (a-z only) lemmas in WordNet."""
     lemmas = set()
     for syn in wn.all_synsets():
         for lemma in syn.lemmas():
@@ -96,79 +166,176 @@ def collect_lemmas(wn):
     return lemmas
 
 
-def write_idx(path, words, offsets):
+def apply_sense_labels(words, sense_labels, offensive, adult, mild_list):
+    """
+    Apply sense_labels.tsv: for each row (word, def_prefix, minTierName), find the
+    matching meaning and raise its minTier to at least the named value.
+    """
+    for row in sense_labels:
+        if len(row) < 3:
+            continue
+        word, def_prefix, tier_name = row[0].lower(), row[1], row[2].lower()
+        named_tier = TIER_NAMES.get(tier_name)
+        if named_tier is None:
+            print(f"  sense_labels: unknown tier '{tier_name}' for '{word}' — skipped", file=sys.stderr)
+            continue
+        if word not in words:
+            continue
+        meanings = words[word]
+        matched = False
+        for i, (pc, d, ex, min_t, max_t) in enumerate(meanings):
+            if d.startswith(def_prefix):
+                new_min = max(min_t, named_tier)
+                meanings[i] = (pc, d, ex, new_min, max_t)
+                matched = True
+                break
+        if not matched:
+            print(f"  sense_labels: no match for '{word}' / '{def_prefix[:40]}' — skipped", file=sys.stderr)
+
+
+def apply_overrides(words, override_rows, offensive, adult, mild_list):
+    """
+    Apply overrides.tsv: for each matched meaning (post-labels minTier = M), append a
+    new sanitised meaning with minTier = headword_floor(word) and maxTier = M-1.
+    Skips (with log) if M-1 < headword_floor(word).
+    """
+    for row in override_rows:
+        if len(row) < 3:
+            continue
+        word = row[0].lower()
+        def_prefix = row[1]
+        sanitised_def = row[2][:MAX_DEF]
+        sanitised_ex = row[3][:MAX_EX] if len(row) > 3 else ""
+
+        if word not in words:
+            continue
+        meanings = words[word]
+        hw_floor = headword_floor(word, offensive, adult, mild_list)
+
+        for i, (pc, d, ex, min_t, max_t) in enumerate(meanings):
+            if d.startswith(def_prefix):
+                M = min_t  # post-label minTier
+                if M - 1 < hw_floor:
+                    print(
+                        f"  overrides: skip '{word}' / '{def_prefix[:40]}': "
+                        f"M-1={M-1} < headword_floor={hw_floor}",
+                        file=sys.stderr,
+                    )
+                    break
+                # Append a sanitised sibling with minTier=hw_floor, maxTier=M-1.
+                words[word].append((pc, sanitised_def, sanitised_ex, hw_floor, M - 1))
+                break
+
+
+def write_idx(path, terms, offsets, word_min_tiers):
+    """Write a v3 index file: DIDX | u32 version=3 | u32 count | entries."""
     with open(path, "wb") as f:
         f.write(b"DIDX")
-        f.write(struct.pack("<II", VERSION, len(words)))
-        for t in words:
-            f.write(struct.pack("<I", offsets[t]))
-            f.write(t.encode("ascii") + b"\x00")
+        f.write(struct.pack("<II", VERSION, len(terms)))
+        for t in terms:
+            f.write(struct.pack("<I", offsets[t]))          # u32 dataOffset
+            f.write(struct.pack("<B", word_min_tiers[t]))   # u8 wordMinTier
+            f.write(t.encode("ascii") + b"\x00")            # term + NUL
 
 
 def main():
     print("Loading WordNet (first run downloads it)...")
     wn = get_wordnet()
 
-    # Load the three category word lists.
-    offensive = load_blocklist("words_offensive.txt")
-    adult = load_blocklist("words_adult.txt")
-    mild_list = load_blocklist("words_mild.txt")  # named mild_list to avoid shadowing the tier
-    print(f"  category lists: {len(offensive)} offensive, {len(adult)} adult, {len(mild_list)} mild")
+    # Load the four category word lists.
+    offensive = load_wordlist("words_offensive.txt")
+    adult = load_wordlist("words_adult.txt")
+    mild_list = load_wordlist("words_mild.txt")
+    core_harmful = load_wordlist("core_harmful.txt")
+    print(
+        f"  category lists: {len(offensive)} offensive, {len(adult)} adult, "
+        f"{len(mild_list)} mild, {len(core_harmful)} core_harmful"
+    )
 
-    print("Extracting meanings...")
+    # gloss_core: core_harmful minus the retard* exception (those words gate the headword
+    # but must not raise the tier of innocent definitions that use the word medically).
+    retard_exceptions = {"retard", "retards", "retarded"}
+    gloss_core = core_harmful - retard_exceptions
+
+    # Load optional TSV files.
+    sense_labels = load_tsv("sense_labels.tsv")
+    override_rows = load_tsv("overrides.tsv")
+    print(
+        f"  sense_labels: {len(sense_labels)} rows, overrides: {len(override_rows)} rows"
+        + (" (files may be absent — handled gracefully)" if not sense_labels and not override_rows else "")
+    )
+
+    print("Extracting meanings from WordNet...")
     words = {}
     for w in collect_lemmas(wn):
-        ms = meanings_for(w, wn)
+        ms = meanings_for(w, wn, offensive, adult, mild_list, gloss_core)
         if ms:
             words[w] = ms
 
-    # terms is the FULL set — all WordNet lemmas with at least one meaning.
-    terms = sorted(words)
+    print(f"  extracted {len(words)} lemmas (cap {SENSE_CAP})")
 
-    # Build the four tier subsets (each a strict subset of the next).
-    full = terms
-    teen = [t for t in terms if t not in offensive]
-    mild = [t for t in teen if t not in adult]
-    safe = [t for t in mild if t not in mild_list]
-    print(f"  full={len(full)}, teen={len(teen)}, mild={len(mild)}, safe={len(safe)} (cap {SENSE_CAP})")
+    # Apply sense_labels (raise minTier for specific senses).
+    if sense_labels:
+        apply_sense_labels(words, sense_labels, offensive, adult, mild_list)
+        print(f"  applied {len(sense_labels)} sense_label rows")
+
+    # Apply overrides (append sanitised sibling meanings).
+    if override_rows:
+        apply_overrides(words, override_rows, offensive, adult, mild_list)
+        print(f"  applied {len(override_rows)} override rows")
+
+    # Compute wordMinTier = min(minTier) over all meanings (incl. appended).
+    word_min_tiers = {}
+    for w, ms in words.items():
+        word_min_tiers[w] = min(min_t for (_, _, _, min_t, _) in ms)
+
+    # Full sorted term list (single index, all words).
+    terms = sorted(words)
 
     os.makedirs(OUT_DIR, exist_ok=True)
     dat_path = os.path.join(OUT_DIR, "dict.dat")
 
-    # Write ALL terms to dict.dat and record their offsets.
-    # Every tier index looks up offsets in this shared table.
+    # Write all terms to dict.dat and record their offsets.
     offsets = {}
     with open(dat_path, "wb") as dat:
         for t in terms:
             offsets[t] = dat.tell()
             ms = words[t]
-            dat.write(struct.pack("<B", len(ms)))
-            for pc, d, ex in ms:
+            dat.write(struct.pack("<B", len(ms)))   # u8 nMeanings
+            for pc, d, ex, min_t, max_t in ms:
+                tier_range = min_t | (max_t << 2)
                 db = d.encode("utf-8")[:MAX_DEF]
                 eb = ex.encode("utf-8")[:MAX_EX]
-                dat.write(struct.pack("<B", pc))
-                dat.write(struct.pack("<H", len(db)) + db)
-                dat.write(struct.pack("<H", len(eb)) + eb)
+                dat.write(struct.pack("<B", tier_range))   # u8 tierRange
+                dat.write(struct.pack("<B", pc))           # u8 posCode
+                dat.write(struct.pack("<H", len(db)) + db) # u16 defLen + def
+                dat.write(struct.pack("<H", len(eb)) + eb) # u16 exLen + example
 
-    # Write the four tier index files.
-    write_idx(os.path.join(OUT_DIR, "dict_full.idx"), full, offsets)
-    write_idx(os.path.join(OUT_DIR, "dict_teen.idx"), teen, offsets)
-    write_idx(os.path.join(OUT_DIR, "dict_mild.idx"), mild, offsets)
-    write_idx(os.path.join(OUT_DIR, "dict_safe.idx"), safe, offsets)
+    # Write the single v3 index file.
+    idx_path = os.path.join(OUT_DIR, "dict.idx")
+    write_idx(idx_path, terms, offsets, word_min_tiers)
 
-    # Compute sizes and report.
+    # Report sizes.
     dat_sz = os.path.getsize(dat_path)
-    idx_files = ["dict_full.idx", "dict_teen.idx", "dict_mild.idx", "dict_safe.idx"]
-    idx_sizes = {f: os.path.getsize(os.path.join(OUT_DIR, f)) for f in idx_files}
-    total = dat_sz + sum(idx_sizes.values())
+    idx_sz = os.path.getsize(idx_path)
+    total = dat_sz + idx_sz
 
-    print(f"Wrote data/dict.dat      ({dat_sz:,} bytes)")
-    for f in idx_files:
-        tier_name = f.replace("dict_", "").replace(".idx", "").capitalize()
-        print(f"Wrote data/{f:<20} ({idx_sizes[f]:,} bytes)")
-    print(f"Total {total / 1048576:.2f} MB. Flash with: pio run -t uploadfs")
+    # Simulated per-tier visible word counts (wordMinTier <= activeTier).
+    tier_counts = {t: sum(1 for wmt in word_min_tiers.values() if wmt <= t) for t in (SAFE, MILD, TEEN, FULL)}
+
+    print(f"Wrote data/dict.dat  ({dat_sz:,} bytes)")
+    print(f"Wrote data/dict.idx  ({idx_sz:,} bytes)")
+    print(f"Total {total / 1048576:.2f} MB.  Flash with: pio run -t uploadfs")
+    print(
+        f"Visible at tiers — Safe: {tier_counts[SAFE]:,}  Mild: {tier_counts[MILD]:,}  "
+        f"Teen: {tier_counts[TEEN]:,}  Full: {tier_counts[FULL]:,}  (SENSE_CAP={SENSE_CAP})"
+    )
+
     if total > 14 * 1048576:
-        print("WARNING: exceeds ~14 MB LittleFS budget; lower DICT_SENSE_CAP.", file=sys.stderr)
+        print(
+            "WARNING: total exceeds ~14 MB LittleFS budget; lower DICT_SENSE_CAP or trim lists.",
+            file=sys.stderr,
+        )
     return 0
 
 
