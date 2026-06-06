@@ -4,8 +4,8 @@
 // Dictionary data source (format v2: multiple meanings per word).
 //
 // Sources, in priority order: SD card override -> built-in LittleFS corpus ->
-// embedded fallback (WordData.h, single meaning). The active tier (Everyone or
-// Kids) selects which index file is used over the shared dict.dat.
+// embedded fallback (WordData.h, single meaning). The active tier selects which
+// index file is used over the shared dict.dat.
 //
 // The index lives in PSRAM; meanings are streamed from dict.dat on demand.
 // ==============================================================================
@@ -13,7 +13,7 @@
 #include <Arduino.h>
 #include <vector>
 
-enum DictTier { TIER_EVERYONE = 0, TIER_KIDS = 1 };
+enum DictTier { TIER_SAFE = 0, TIER_MILD = 1, TIER_TEEN = 2, TIER_FULL = 3 };
 
 struct Meaning
 {

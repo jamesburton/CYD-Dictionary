@@ -19,11 +19,27 @@ static const char**  s_term     = nullptr;   // term pointers into s_idx (PSRAM)
 static uint32_t*     s_dataOff  = nullptr;   // dict.dat offset per entry (PSRAM)
 static int           s_count    = 0;
 static File          s_dat;                  // shared dict.dat handle
-static DictTier      s_tier     = TIER_EVERYONE;
+static DictTier      s_tier     = TIER_FULL;
 static char          s_status[64] = "Built-in set";
 
-static const char* tierIdxPath(DictTier t) { return t == TIER_KIDS ? "/dict_kids.idx" : "/dict.idx"; }
-static const char* tierName(DictTier t)    { return t == TIER_KIDS ? "Kids" : "Everyone"; }
+static const char* tierIdxPath(DictTier t)
+{
+    switch (t) {
+        case TIER_SAFE: return "/dict_safe.idx";
+        case TIER_MILD: return "/dict_mild.idx";
+        case TIER_TEEN: return "/dict_teen.idx";
+        default:        return "/dict_full.idx";
+    }
+}
+static const char* tierName(DictTier t)
+{
+    switch (t) {
+        case TIER_SAFE: return "Safe";
+        case TIER_MILD: return "Mild";
+        case TIER_TEEN: return "Teen";
+        default:        return "Full";
+    }
+}
 
 static void setStatus(const char* msg) { strncpy(s_status, msg, sizeof(s_status) - 1); s_status[sizeof(s_status) - 1] = 0; }
 

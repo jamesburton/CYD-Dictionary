@@ -721,46 +721,47 @@ static void handleHistory(const Tap& t)
 // ----------------------------------------------------------------------------
 struct MoreBtn { int x, y, w, h; const char* label; };
 static MoreBtn g_moreBtns[4];     // Random, Recent, Recalibrate, Set/Change PIN
-static MoreBtn g_tierBtn;         // the Everyone/Kids toggle row
+static MoreBtn g_tierPills[4];    // Safe / Mild / Teen / Full selector pills
 
 static void drawMore()
 {
     lcd.fillScreen(C_BG);
     drawHeader("More");
 
-    // Word of the Day card (compact)
-    int cardX = 8, cardY = HEADER_H + 6, cardW = SCREEN_W - 16, cardH = 46;
+    int cardX = 8, cardY = HEADER_H + 4, cardW = SCREEN_W - 16, cardH = 40;
     lcd.fillRoundRect(cardX, cardY, cardW, cardH, 8, C_WOD);
     lcd.drawRoundRect(cardX, cardY, cardW, cardH, 8, C_WODBORD);
     lcd.setFont(&fonts::Font2);
     lcd.setTextDatum(textdatum_t::top_left);
     lcd.setTextColor(C_SUB, C_WOD);
-    lcd.drawString("WORD OF THE DAY", cardX + 8, cardY + 4);
+    lcd.drawString("WORD OF THE DAY", cardX + 8, cardY + 3);
     lcd.setFont(&fonts::Font4);
     lcd.setTextColor(C_TEXT, C_WOD);
-    lcd.drawString(dictTerm(g_wotd), cardX + 8, cardY + 20);
+    lcd.drawString(dictTerm(g_wotd), cardX + 8, cardY + 18);
 
-    // Tier toggle row: "Dictionary:  [Everyone] [Kids]"
-    int ty = cardY + cardH + 8;
-    g_tierBtn = {8, ty, SCREEN_W - 16, 30, "tier"};
+    // Tier selector
+    int ty = cardY + cardH + 4;
     lcd.setFont(&fonts::Font2);
-    lcd.setTextDatum(textdatum_t::middle_left);
+    lcd.setTextDatum(textdatum_t::top_left);
     lcd.setTextColor(C_TEXT, C_BG);
-    lcd.drawString("Dictionary:", 12, ty + 15);
-    int pillW = 90, pillH = 26, gap = 6;
-    int px = SCREEN_W - 8 - pillW * 2 - gap;
-    bool kids = (dictTier() == TIER_KIDS);
+    lcd.drawString(String("Tier:") + (getPin().length() ? "   (locked)" : ""), 12, ty);
+    int py = ty + 16;
+    const char* tlabels[4] = {"Safe", "Mild", "Teen", "Full"};
+    int gap = 6, pw = (SCREEN_W - 16 - gap * 3) / 4, ph = 26;
     lcd.setTextDatum(textdatum_t::middle_center);
-    lcd.fillRoundRect(px, ty + 2, pillW, pillH, 13, kids ? C_ROWLINE : C_ACCENT);
-    lcd.setTextColor(kids ? C_SUB : C_HEADERTX, kids ? C_ROWLINE : C_ACCENT);
-    lcd.drawString("Everyone", px + pillW / 2, ty + 15);
-    lcd.fillRoundRect(px + pillW + gap, ty + 2, pillW, pillH, 13, kids ? C_ACCENT : C_ROWLINE);
-    lcd.setTextColor(kids ? C_HEADERTX : C_SUB, kids ? C_ACCENT : C_ROWLINE);
-    lcd.drawString(String("Kids") + (getPin().length() ? " (lock)" : ""), px + pillW + gap + pillW / 2, ty + 15);
+    for (int i = 0; i < 4; ++i) {
+        int px = 8 + i * (pw + gap);
+        g_tierPills[i] = {px, py, pw, ph, tlabels[i]};
+        bool on = ((int)dictTier() == i);
+        lcd.fillRoundRect(px, py, pw, ph, 6, on ? C_ACCENT : C_ROWLINE);
+        lcd.setTextColor(on ? C_HEADERTX : C_SUB, on ? C_ACCENT : C_ROWLINE);
+        lcd.drawString(tlabels[i], px + pw / 2, py + ph / 2);
+    }
 
-    // 2x2 button grid
+    // 2x2 buttons
     const char* labels[4] = {"Random word", "Recent words", "Recalibrate", "Set / Change PIN"};
-    int by = ty + 36, bw = (SCREEN_W - 16 - 8) / 2, bh = 30, bgap = 8;
+    int by = py + ph + 6;
+    int bw = (SCREEN_W - 16 - 8) / 2, bh = 28, bgap = 6;
     for (int i = 0; i < 4; ++i) {
         int r = i / 2, c = i % 2;
         int bx = 8 + c * (bw + 8);
@@ -773,11 +774,11 @@ static void drawMore()
         lcd.drawString(labels[i], bx + bw / 2, yy + bh / 2);
     }
 
-    // status line
+    // status
     lcd.setTextDatum(textdatum_t::top_left);
     lcd.setFont(&fonts::Font2);
     lcd.setTextColor(C_SUB, C_BG);
-    lcd.drawString(dictStatus(), 10, by + 2 * bh + bgap + 6);
+    lcd.drawString(dictStatus(), 10, by + 2 * bh + bgap + 4);
 
     drawTabBar(SCR_MORE);
 }
@@ -803,11 +804,10 @@ static void recalibrateTouch()
 static void switchTier(DictTier target)
 {
     if (target == dictTier()) return;
-    // Leaving Kids -> Everyone requires the PIN if one is set.
-    if (dictTier() == TIER_KIDS && target == TIER_EVERYONE) {
+    if ((int)target > (int)dictTier()) {       // becoming more permissive
         String pin = getPin();
         if (pin.length()) {
-            String got = promptPin("Enter PIN to leave Kids mode");
+            String got = promptPin("Enter PIN to unlock");
             if (got != pin) { drawMore(); return; }
         }
     }
@@ -823,33 +823,20 @@ static void handleMore(const Tap& t)
 {
     if (handleTabBar(t)) return;
 
-    // WotD card
-    int cardY = HEADER_H + 6;
-    if (t.y >= cardY && t.y < cardY + 46) { openDefinition(g_wotd); return; }
+    int cardY = HEADER_H + 4;
+    if (t.y >= cardY && t.y < cardY + 40) { openDefinition(g_wotd); return; }
 
-    // Tier pills
-    if (inRect(t, g_tierBtn.x, g_tierBtn.y, g_tierBtn.w, g_tierBtn.h)) {
-        int pillW = 90, gap = 6;
-        int px = SCREEN_W - 8 - pillW * 2 - gap;
-        if (t.x >= px && t.x < px + pillW) switchTier(TIER_EVERYONE);
-        else if (t.x >= px + pillW + gap && t.x < px + pillW + gap + pillW) switchTier(TIER_KIDS);
-        return;
+    for (int i = 0; i < 4; ++i) {
+        MoreBtn& p = g_tierPills[i];
+        if (inRect(t, p.x, p.y, p.w, p.h)) { switchTier((DictTier)i); return; }
     }
-
     for (int i = 0; i < 4; ++i) {
         MoreBtn& b = g_moreBtns[i];
         if (inRect(t, b.x, b.y, b.w, b.h)) {
-            if (i == 0) {                                   // Random
-                openDefinition((int)(esp_random() % dictCount()));
-            } else if (i == 1) {                            // Recent
-                g_screen = SCR_HISTORY; g_historyOffset = 0; drawHistory();
-            } else if (i == 2) {                            // Recalibrate
-                recalibrateTouch(); g_wasTouched = false; drawMore();
-            } else {                                        // Set / Change PIN
-                String p = promptPin("New PIN (Cancel = clear)");
-                setPin(p);   // empty string clears the lock
-                drawMore();
-            }
+            if (i == 0) openDefinition((int)(esp_random() % dictCount()));
+            else if (i == 1) { g_screen = SCR_HISTORY; g_historyOffset = 0; drawHistory(); }
+            else if (i == 2) { recalibrateTouch(); g_wasTouched = false; drawMore(); }
+            else { String np = promptPin("New PIN (Cancel = clear)"); setPin(np); drawMore(); }
             return;
         }
     }
@@ -1095,7 +1082,7 @@ void setup()
     prefs.begin("dict", false);
 
     // Load the dictionary for the saved tier (SD corpus if present, else flash, else embedded).
-    DictTier startTier = (DictTier)prefs.getUChar("tier", TIER_EVERYONE);
+    DictTier startTier = (DictTier)prefs.getUChar("tier", TIER_FULL);
     dictBegin(startTier);
 
     loadState();
