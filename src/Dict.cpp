@@ -2,15 +2,23 @@
 #include "WordData.h"
 #include "DisplayConfig.hpp"
 
+#include <FS.h>
 #include <SD_MMC.h>
+#include <LittleFS.h>
 #include <esp_heap_caps.h>
 #include <string.h>
 
 // ----------------------------------------------------------------------------
-// SD-backed state. All large buffers live in PSRAM and are never freed (valid
-// for the whole session).
+// Source state. The dictionary is loaded from the first available of:
+//   1. SD card    (optional override - swap dictionaries without reflashing)
+//   2. LittleFS   (built-in full corpus, flashed with `pio run -t uploadfs`)
+//   3. embedded   (tiny child-friendly set in WordData.h, last resort)
+//
+// The index lives in PSRAM (term blob + offset arrays); definitions are streamed
+// from the source filesystem on demand. dict.idx/dict.dat have the same on-disk
+// format on SD and LittleFS, so one loader serves both.
 // ----------------------------------------------------------------------------
-static bool          s_sd       = false;
+static bool          s_loaded   = false;
 static uint8_t*      s_idx      = nullptr;   // entire dict.idx file (PSRAM)
 static const char**  s_term     = nullptr;   // term pointers into s_idx (PSRAM)
 static uint32_t*     s_dataOff  = nullptr;   // dict.dat offset per entry (PSRAM)
@@ -32,90 +40,106 @@ static String readField(uint32_t len)
     return String(buf);
 }
 
-// Loads dict.idx fully into PSRAM and builds the term/offset arrays.
-static bool loadIndex()
+// Loads dict.idx + dict.dat from a mounted filesystem. `tag` ("SD"/"Flash")
+// prefixes any status message. Returns true on success; on failure sets a
+// specific status and leaves s_loaded false so the caller can try the next source.
+static bool loadFromFS(fs::FS& fs, const char* tag)
 {
-    File f = SD_MMC.open("/dict.idx", FILE_READ);
-    if (!f) { setStatus("SD ok, dict.idx missing"); return false; }
+    char st[64];
+
+    File f = fs.open("/dict.idx", FILE_READ);
+    if (!f) { snprintf(st, sizeof(st), "%s ok, dict.idx missing", tag); setStatus(st); return false; }
 
     size_t sz = f.size();
-    s_idx = static_cast<uint8_t*>(heap_caps_malloc(sz, MALLOC_CAP_SPIRAM));
-    if (!s_idx) { setStatus("SD ok, PSRAM alloc failed"); f.close(); return false; }
+    uint8_t* idx = static_cast<uint8_t*>(heap_caps_malloc(sz, MALLOC_CAP_SPIRAM));
+    if (!idx) { snprintf(st, sizeof(st), "%s ok, PSRAM alloc failed", tag); setStatus(st); f.close(); return false; }
 
-    size_t got = f.read(s_idx, sz);   // one big read; per-record reads would be slow
+    size_t got = f.read(idx, sz);   // one big read; per-record reads would be slow
     f.close();
-    if (got != sz) { setStatus("SD ok, dict.idx short read"); return false; }
+    if (got != sz) { snprintf(st, sizeof(st), "%s ok, dict.idx short read", tag); setStatus(st); heap_caps_free(idx); return false; }
+    if (memcmp(idx, "DIDX", 4) != 0) { snprintf(st, sizeof(st), "%s ok, dict.idx bad magic", tag); setStatus(st); heap_caps_free(idx); return false; }
 
-    if (memcmp(s_idx, "DIDX", 4) != 0) { setStatus("SD ok, dict.idx bad magic"); return false; }
     uint32_t version = 0, count = 0;
-    memcpy(&version, s_idx + 4, 4);
-    memcpy(&count,   s_idx + 8, 4);
+    memcpy(&version, idx + 4, 4);
+    memcpy(&count,   idx + 8, 4);
 
-    s_term    = static_cast<const char**>(heap_caps_malloc(sizeof(char*) * count, MALLOC_CAP_SPIRAM));
-    s_dataOff = static_cast<uint32_t*>(heap_caps_malloc(sizeof(uint32_t) * count, MALLOC_CAP_SPIRAM));
-    if (!s_term || !s_dataOff) { setStatus("SD ok, PSRAM alloc failed"); return false; }
+    const char** term    = static_cast<const char**>(heap_caps_malloc(sizeof(char*) * count, MALLOC_CAP_SPIRAM));
+    uint32_t*    dataOff = static_cast<uint32_t*>(heap_caps_malloc(sizeof(uint32_t) * count, MALLOC_CAP_SPIRAM));
+    if (!term || !dataOff) {
+        snprintf(st, sizeof(st), "%s ok, PSRAM alloc failed", tag); setStatus(st);
+        heap_caps_free(idx); heap_caps_free(term); heap_caps_free(dataOff);
+        return false;
+    }
+
+    File dat = fs.open("/dict.dat", FILE_READ);
+    if (!dat) {
+        snprintf(st, sizeof(st), "%s ok, dict.dat missing", tag); setStatus(st);
+        heap_caps_free(idx); heap_caps_free(term); heap_caps_free(dataOff);
+        return false;
+    }
 
     // Each record: [u32 dataOffset][term bytes][0x00]. Term pointers index into
-    // s_idx, so the C-strings come for free.
+    // idx, so the C-strings come for free.
     size_t p = 12;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t off;
-        memcpy(&off, s_idx + p, 4);
+        memcpy(&off, idx + p, 4);
         p += 4;
-        s_dataOff[i] = off;
-        s_term[i] = reinterpret_cast<const char*>(s_idx + p);
-        while (s_idx[p] != 0) ++p;   // skip the term
-        ++p;                          // skip the null terminator
+        dataOff[i] = off;
+        term[i] = reinterpret_cast<const char*>(idx + p);
+        while (idx[p] != 0) ++p;   // skip the term
+        ++p;                        // skip the null terminator
     }
-    s_count = static_cast<int>(count);
+
+    s_idx     = idx;
+    s_term    = term;
+    s_dataOff = dataOff;
+    s_count   = static_cast<int>(count);
+    s_dat     = dat;
+    s_loaded  = true;
+
+    snprintf(st, sizeof(st), "%s: %d words", tag, s_count);
+    setStatus(st);
     return true;
 }
 
 bool dictBegin()
 {
+    // 1. SD card override, if a card with a dictionary is present.
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
-    if (!SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_DEFAULT, 5)) {
-        setStatus("SD mount failed");
-        return false;
-    }
-    if (SD_MMC.cardType() == CARD_NONE) {
-        setStatus("No SD card");
-        return false;
+    if (SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_DEFAULT, 5) &&
+        SD_MMC.cardType() != CARD_NONE) {
+        if (loadFromFS(SD_MMC, "SD")) return true;
+        SD_MMC.end();   // card present but no usable dictionary; fall through
     }
 
-    if (!loadIndex()) {
-        return false;   // loadIndex() already set a specific status
-    }
-    s_dat = SD_MMC.open("/dict.dat", FILE_READ);
-    if (!s_dat) {
-        setStatus("SD ok, dict.dat missing");
-        return false;
+    // 2. Built-in corpus in flash (LittleFS).
+    if (LittleFS.begin(false)) {
+        if (loadFromFS(LittleFS, "Flash")) return true;
+    } else {
+        setStatus("Flash FS mount failed");
     }
 
-    s_sd = true;
-    char msg[48];
-    snprintf(msg, sizeof(msg), "SD: %d words", s_count);
-    setStatus(msg);
-    return true;
+    // 3. Embedded fallback set.
+    setStatus("Built-in set");
+    return false;
 }
-
-bool dictUsingSD() { return s_sd; }
 
 const char* dictStatus() { return s_status; }
 
-int dictCount() { return s_sd ? s_count : WORD_COUNT; }
+int dictCount() { return s_loaded ? s_count : WORD_COUNT; }
 
 const char* dictTerm(int i)
 {
     if (i < 0 || i >= dictCount()) return "";
-    return s_sd ? s_term[i] : WORDS[i].term;
+    return s_loaded ? s_term[i] : WORDS[i].term;
 }
 
 bool dictGet(int i, DictEntry& e)
 {
     if (i < 0 || i >= dictCount()) return false;
 
-    if (!s_sd) {
+    if (!s_loaded) {
         e.term    = WORDS[i].term;
         e.pos     = WORDS[i].pos;
         e.def     = WORDS[i].def;

@@ -16,18 +16,23 @@ The UI is search-first (Layout B) with a persistent bottom tab bar:
 
 ## Dictionary source
 
-The firmware reads its words from one of two places, picked automatically at boot:
+The packed dictionary is only ~5.1 MB, so it lives in the device's own 16 MB
+flash — no SD card needed. The firmware picks a source automatically at boot, in
+priority order:
 
-1. **SD card** (preferred) – the full Wordset corpus (~64,600 words) streamed from
-   `dict.idx` + `dict.dat` on the card. Terms live in PSRAM for instant search;
-   definitions are read on demand.
-2. **Embedded set** (fallback) – a ~90-word child-friendly list baked into the
-   firmware (`src/WordData.h`), used whenever the SD card or its files are absent.
+1. **SD card** (optional override) – if a card holds `dict.idx` + `dict.dat`, it
+   wins, letting you swap dictionaries without reflashing.
+2. **Flash / LittleFS** (built-in default) – the full Wordset corpus (~64,600
+   words) flashed into the device. This is the normal source.
+3. **Embedded set** (last resort) – a ~90-word child-friendly list baked into the
+   firmware (`src/WordData.h`), used only if both above are unavailable.
 
-The active source and word count are shown at the bottom of the **More** screen,
-e.g. `SD: 64645 words` or `SD ok, dict.idx missing`.
+In every case the 864 KB index is loaded into PSRAM for instant prefix search;
+definitions are streamed from the source on demand. The active source and word
+count are shown at the bottom of the **More** screen (e.g. `Flash: 64645 words`),
+and printed at boot over the USB console (`[dict] ready: Flash: 64645 words`).
 
-## Putting the full dictionary on the SD card
+## Building the dictionary into flash (default)
 
 1. Generate the files (one-time; needs Python 3):
 
@@ -36,16 +41,29 @@ e.g. `SD: 64645 words` or `SD ok, dict.idx missing`.
    python tools/build_dict.py
    ```
 
-   This writes `sdcard/dict.idx` and `sdcard/dict.dat`.
+   This writes `data/dict.idx` and `data/dict.dat` (`data/` is PlatformIO's
+   filesystem-image source directory).
 
-2. Format the microSD card as **FAT32** and copy **both** files to its **root**:
+2. Flash the dictionary image into the device's LittleFS partition:
 
+   ```sh
+   pio run -t uploadfs
    ```
-   <SD root>/dict.idx
-   <SD root>/dict.dat
-   ```
 
-3. Insert the card and reboot. The More screen should report `SD: 64645 words`.
+3. Reboot. The More screen should report `Flash: 64645 words`.
+
+### Optional: overriding from an SD card
+
+To swap in a different dictionary without reflashing, copy the same two files to
+the **root** of a **FAT32** microSD card and insert it:
+
+```
+<SD root>/dict.idx
+<SD root>/dict.dat
+```
+
+A card with a valid dictionary takes priority over the built-in flash copy; the
+More screen will then read `SD: 64645 words`.
 
 ### On-disk format
 
@@ -65,10 +83,15 @@ of regenerating these two files.
 ## Build & flash
 
 ```sh
-pio run                # build
-pio run -t upload      # flash (COM5; see platformio.ini)
-pio device monitor     # serial (UART0)
+pio run                # build firmware
+pio run -t upload      # flash firmware (COM5; see platformio.ini)
+pio run -t uploadfs    # flash the dictionary into LittleFS (see above)
 ```
+
+> **Serial note:** `platformio.ini` sets `ARDUINO_USB_CDC_ON_BOOT=0` so the COM
+> port stays stable for flashing. As a result Arduino `Serial` is on UART0
+> (physical pins), not USB — only ROM/ESP-IDF logs (and the `esp_rom_printf`
+> boot line) appear over the USB console.
 
 Touch calibration runs once on first boot and is stored in NVS; re-run it any
 time from **More → Recalibrate touch**.

@@ -22,15 +22,14 @@ struct DictEntry
     String example;   // example sentence ("" if none)
 };
 
-// Mounts the SD card and loads the on-disk index into PSRAM. Returns true if the
-// SD dictionary is available; false means the embedded set is used instead.
+// Loads the dictionary from the first available source: SD card override, then
+// the built-in LittleFS corpus, then the embedded set. The index is read into
+// PSRAM. Returns true if a file-backed corpus loaded; false means the embedded
+// fallback is active.
 bool dictBegin();
 
-// True when the SD-backed corpus is active (false = embedded fallback).
-bool dictUsingSD();
-
-// Human-readable source/diagnostic string, e.g. "SD: 64645 words",
-// "No SD card", or "SD ok, dict.idx missing". Shown on the More screen.
+// Human-readable source/diagnostic string, e.g. "Flash: 64645 words",
+// "SD: 64645 words", or "Flash ok, dict.idx missing". Shown on the More screen.
 const char* dictStatus();
 
 // Number of words in the active source.

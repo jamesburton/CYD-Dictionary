@@ -890,8 +890,8 @@ void setup()
 
     buildResults();
     drawSearchScreen();
-    Serial.printf("CYD Dictionary ready: %d words (%s)\n",
-                  dictCount(), dictUsingSD() ? "SD" : "embedded");
+    // esp_rom_printf reaches the USB-Serial/JTAG console (Serial is on UART0 here).
+    esp_rom_printf("[dict] ready: %s\n", dictStatus());
 }
 
 void loop()

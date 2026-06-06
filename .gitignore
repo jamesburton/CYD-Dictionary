@@ -493,5 +493,7 @@ $RECYCLE.BIN/
 # Vendored Wordset corpus clone (re-fetch with the git clone in tools/build_dict.py's header)
 tools/wordset/
 
-# Generated SD-card dictionary artifacts (rebuild with: python tools/build_dict.py)
+# Generated dictionary artifacts (rebuild with: python tools/build_dict.py)
+# data/ is the LittleFS image source flashed via `pio run -t uploadfs`.
+data/
 sdcard/

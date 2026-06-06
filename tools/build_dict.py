@@ -3,7 +3,11 @@
 Build the on-SD dictionary files (dict.idx + dict.dat) from the Wordset corpus.
 
 Source : tools/wordset/data/*.json  (clone of github.com/wordset/wordset-dictionary)
-Output : sdcard/dict.idx, sdcard/dict.dat   (copy both to the SD card root, FAT32)
+Output : data/dict.idx, data/dict.dat
+
+The `data/` directory is PlatformIO's filesystem image source: flash the built-in
+dictionary with `pio run -t uploadfs`. The same two files can also be copied to an
+SD card root (FAT32) to override the built-in corpus without reflashing.
 
 Format (all integers little-endian, matching the ESP32-S3):
 
@@ -29,7 +33,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "wordset", "data")
-OUT_DIR = os.path.join(os.path.dirname(HERE), "sdcard")
+OUT_DIR = os.path.join(os.path.dirname(HERE), "data")
 
 MAGIC = b"DIDX"
 VERSION = 1
@@ -121,7 +125,8 @@ def main() -> int:
     dat_sz = os.path.getsize(dat_path)
     print(f"Wrote {idx_path}  ({idx_sz:,} bytes)")
     print(f"Wrote {dat_path}  ({dat_sz:,} bytes)")
-    print(f"Done: {len(terms):,} words. Copy both files to the SD card root (FAT32).")
+    print(f"Done: {len(terms):,} words ({(idx_sz + dat_sz) / 1048576:.1f} MB total).")
+    print("Flash into the device with: pio run -t uploadfs")
     return 0
 
 
