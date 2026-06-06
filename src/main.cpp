@@ -10,8 +10,10 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <vector>
+#include <functional>
 #include "LGFX_Setup.hpp"
 #include "WordData.h"
+#include "Dict.h"
 
 static LGFX lcd;
 static Preferences prefs;
@@ -115,11 +117,7 @@ static String lower(const String& s)
 
 static int findWord(const String& term)
 {
-    String t = lower(term);
-    for (int i = 0; i < WORD_COUNT; ++i) {
-        if (t == WORDS[i].term) return i;
-    }
-    return -1;
+    return dictFind(lower(term).c_str());
 }
 
 // ----------------------------------------------------------------------------
@@ -151,7 +149,7 @@ static void loadState()
     splitInto(prefs.getString("hist", ""), g_history);
     uint32_t boot = prefs.getUInt("boot", 0) + 1;
     prefs.putUInt("boot", boot);
-    g_wotd = (WORD_COUNT > 0) ? (int)(boot % WORD_COUNT) : 0;
+    g_wotd = (dictCount() > 0) ? (int)(boot % dictCount()) : 0;
 }
 
 static void saveFavs()    { prefs.putString("favs", joinVec(g_favs)); }
@@ -348,21 +346,30 @@ static int drawWrapped(const String& text, int x, int y, int maxw, int lineH)
 static void buildResults()
 {
     String q = lower(g_query);
+    for (int c = 0; c < 26; ++c) g_valid[c] = false;
+    g_results.clear();
 
-    // Which next letters can still lead to a word (for dimming dead keys).
-    for (int c = 0; c < 26; ++c) {
-        String pre = q + (char)('a' + c);
-        bool ok = false;
-        for (int i = 0; i < WORD_COUNT; ++i) {
-            if (strncmp(WORDS[i].term, pre.c_str(), pre.length()) == 0) { ok = true; break; }
+    int n = dictCount();
+
+    // Empty query: a letter is "live" if any word starts with it.
+    if (q.length() == 0) {
+        for (int c = 0; c < 26; ++c) {
+            char p[2] = {(char)('a' + c), 0};
+            int lb = dictLowerBound(p);
+            g_valid[c] = (lb < n && dictTerm(lb)[0] == ('a' + c));
         }
-        g_valid[c] = ok;
+        return;
     }
 
-    g_results.clear();
-    if (q.length() == 0) return;
-    for (int i = 0; i < WORD_COUNT && (int)g_results.size() < 20; ++i) {
-        if (strncmp(WORDS[i].term, q.c_str(), q.length()) == 0) g_results.push_back(i);
+    // Scan only the contiguous block of terms sharing the query prefix. One pass
+    // fills both the suggestion list (capped) and the dead-key map.
+    int qlen = q.length();
+    for (int i = dictLowerBound(q.c_str()); i < n; ++i) {
+        const char* t = dictTerm(i);
+        if (strncmp(t, q.c_str(), qlen) != 0) break;
+        char nx = t[qlen];
+        if (nx >= 'a' && nx <= 'z') g_valid[nx - 'a'] = true;
+        if ((int)g_results.size() < 20) g_results.push_back(i);
     }
 }
 
@@ -394,7 +401,7 @@ static void drawSuggestionStrip()
     lcd.setTextDatum(textdatum_t::middle_center);
     int x = 6, y = SUG_TOP + 3, h = SUG_H - 6;
     for (size_t i = 0; i < g_results.size() && i < 6; ++i) {
-        const char* term = WORDS[g_results[i]].term;
+        const char* term = dictTerm(g_results[i]);
         int w = lcd.textWidth(term) + 16;
         if (x + w > SCREEN_W - 6) break;
         lcd.fillRoundRect(x, y, w, h, h / 2, C_ACCENT);
@@ -426,7 +433,8 @@ static void drawPreview()
         lcd.drawString("No words found", 10, top + 6);
         return;
     }
-    const Word& w = WORDS[g_results[0]];
+    DictEntry w;
+    dictGet(g_results[0], w);
     lcd.setFont(&fonts::Font4);
     int tw = lcd.textWidth(w.term);
     lcd.setTextColor(C_TEXT, C_BG);
@@ -497,8 +505,12 @@ static int listVisibleRows()
     return (TABBAR_Y - LIST_TOP) / ROW_H;
 }
 
-// Draws up to N word rows from an index list, plus up/down buttons. Returns rows shown.
-static void drawWordList(const std::vector<int>& idxs, int offset)
+// Maps a list position to a dictionary index. Browse maps 1:1; Saved/History map
+// through their term->index vectors.
+using IndexAt = std::function<int(int)>;
+
+// Draws up to N word rows from a list of `total` items, plus up/down buttons.
+static void drawWordList(int total, const IndexAt& at, int offset)
 {
     int listW = SCREEN_W - LIST_BTN_W;
     int areaH = TABBAR_Y - LIST_TOP;
@@ -507,15 +519,16 @@ static void drawWordList(const std::vector<int>& idxs, int offset)
     int rows = listVisibleRows();
     lcd.setFont(&fonts::Font2);
     lcd.setTextDatum(textdatum_t::middle_left);
-    if (idxs.empty()) {
+    if (total == 0) {
         lcd.setTextColor(C_SUB, C_BG);
         lcd.drawString("Nothing here yet", 10, LIST_TOP + 16);
     }
     for (int i = 0; i < rows; ++i) {
         int di = offset + i;
-        if (di >= (int)idxs.size()) break;
+        if (di >= total) break;
         int y = LIST_TOP + i * ROW_H;
-        const Word& w = WORDS[idxs[di]];
+        DictEntry w;
+        dictGet(at(di), w);
         lcd.fillRect(0, y, listW, ROW_H - 1, C_ROW);
         lcd.setTextColor(C_TEXT, C_ROW);
         lcd.drawString(w.term, 10, y + ROW_H / 2);
@@ -538,7 +551,7 @@ static void drawWordList(const std::vector<int>& idxs, int offset)
 
 // Handles taps on a word list. Writes the chosen word index to *chosen (or -1),
 // and updates *offset for scrolling. Returns true if the view needs a redraw.
-static bool handleWordList(const Tap& t, const std::vector<int>& idxs, int* offset, int* chosen)
+static bool handleWordList(const Tap& t, int total, const IndexAt& at, int* offset, int* chosen)
 {
     *chosen = -1;
     int areaH = TABBAR_Y - LIST_TOP;
@@ -550,14 +563,14 @@ static bool handleWordList(const Tap& t, const std::vector<int>& idxs, int* offs
         if (t.y < LIST_TOP + halfH) {            // UP
             *offset = max(0, *offset - rows);
         } else {                                 // DOWN
-            if (*offset + rows < (int)idxs.size()) *offset += rows;
+            if (*offset + rows < total) *offset += rows;
         }
         return true;
     }
     if (t.y >= LIST_TOP && t.y < TABBAR_Y) {
         int i = (t.y - LIST_TOP) / ROW_H;
         int di = *offset + i;
-        if (di < (int)idxs.size()) { *chosen = idxs[di]; }
+        if (di < total) { *chosen = at(di); }
     }
     return false;
 }
@@ -565,23 +578,22 @@ static bool handleWordList(const Tap& t, const std::vector<int>& idxs, int* offs
 // ----------------------------------------------------------------------------
 // BROWSE
 // ----------------------------------------------------------------------------
+// Browse lists every word in order, so position == dictionary index.
+static int browseAt(int pos) { return pos; }
+
 static void drawBrowse()
 {
     lcd.fillScreen(C_BG);
     drawHeader("Browse A-Z");
-    std::vector<int> all;
-    for (int i = 0; i < WORD_COUNT; ++i) all.push_back(i);
-    drawWordList(all, g_browseOffset);
+    drawWordList(dictCount(), browseAt, g_browseOffset);
     drawTabBar(SCR_BROWSE);
 }
 
 static void handleBrowse(const Tap& t)
 {
     if (handleTabBar(t)) return;
-    std::vector<int> all;
-    for (int i = 0; i < WORD_COUNT; ++i) all.push_back(i);
     int chosen;
-    if (handleWordList(t, all, &g_browseOffset, &chosen)) { drawBrowse(); return; }
+    if (handleWordList(t, dictCount(), browseAt, &g_browseOffset, &chosen)) { drawBrowse(); return; }
     if (chosen >= 0) openDefinition(chosen);
 }
 
@@ -599,7 +611,8 @@ static void drawSaved()
 {
     lcd.fillScreen(C_BG);
     drawHeader("Saved Words");
-    drawWordList(favIndices(), g_savedOffset);
+    auto v = favIndices();
+    drawWordList(v.size(), [&v](int i) { return v[i]; }, g_savedOffset);
     drawTabBar(SCR_SAVED);
 }
 
@@ -608,7 +621,10 @@ static void handleSaved(const Tap& t)
     if (handleTabBar(t)) return;
     auto v = favIndices();
     int chosen;
-    if (handleWordList(t, v, &g_savedOffset, &chosen)) { drawSaved(); return; }
+    if (handleWordList(t, v.size(), [&v](int i) { return v[i]; }, &g_savedOffset, &chosen)) {
+        drawSaved();
+        return;
+    }
     if (chosen >= 0) openDefinition(chosen);
 }
 
@@ -626,7 +642,8 @@ static void drawHistory()
 {
     lcd.fillScreen(C_BG);
     drawHeader("Recent Words  (<- More)");
-    drawWordList(historyIndices(), g_historyOffset);
+    auto v = historyIndices();
+    drawWordList(v.size(), [&v](int i) { return v[i]; }, g_historyOffset);
     drawTabBar(SCR_MORE);
 }
 
@@ -635,7 +652,10 @@ static void handleHistory(const Tap& t)
     if (handleTabBar(t)) return;   // tapping a tab leaves history
     auto v = historyIndices();
     int chosen;
-    if (handleWordList(t, v, &g_historyOffset, &chosen)) { drawHistory(); return; }
+    if (handleWordList(t, v.size(), [&v](int i) { return v[i]; }, &g_historyOffset, &chosen)) {
+        drawHistory();
+        return;
+    }
     if (chosen >= 0) openDefinition(chosen);
 }
 
@@ -660,7 +680,7 @@ static void drawMore()
     lcd.drawString("WORD OF THE DAY", cardX + 10, cardY + 6);
     lcd.setFont(&fonts::Font4);
     lcd.setTextColor(C_TEXT, C_WOD);
-    lcd.drawString(WORDS[g_wotd].term, cardX + 10, cardY + 24);
+    lcd.drawString(dictTerm(g_wotd), cardX + 10, cardY + 24);
 
     // Buttons
     const char* labels[3] = {"Random word", "Recent words", "Recalibrate touch"};
@@ -675,7 +695,13 @@ static void drawMore()
         lcd.drawString(labels[i], bx + bw / 2, by + bh / 2);
         by += bh + gap;
     }
+
+    // Dictionary source / size status.
     lcd.setTextDatum(textdatum_t::top_left);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextColor(C_SUB, C_BG);
+    lcd.drawString(dictStatus(), 10, by + 2);
+
     drawTabBar(SCR_MORE);
 }
 
@@ -709,7 +735,7 @@ static void handleMore(const Tap& t)
         MoreBtn& b = g_moreBtns[i];
         if (inRect(t, b.x, b.y, b.w, b.h)) {
             if (i == 0) {                                   // Random
-                openDefinition((int)(esp_random() % WORD_COUNT));
+                openDefinition((int)(esp_random() % dictCount()));
             } else if (i == 1) {                            // Recent
                 g_screen = SCR_HISTORY; g_historyOffset = 0; drawHistory();
             } else {                                        // Recalibrate
@@ -730,7 +756,8 @@ static const int DEF_STAR_W = 50;
 
 static void drawDefinition()
 {
-    const Word& w = WORDS[g_currentWord];
+    DictEntry w;
+    dictGet(g_currentWord, w);
     lcd.fillScreen(C_BG);
 
     // Top bar: Back + Star
@@ -764,7 +791,7 @@ static void drawDefinition()
     y = drawWrapped(w.def, 10, y, SCREEN_W - 20, 20) + 6;
 
     // Example
-    if (w.example && strlen(w.example)) {
+    if (w.example.length()) {
         lcd.setTextColor(C_SUB, C_BG);
         drawWrapped(String("\"") + w.example + "\"", 10, y, SCREEN_W - 20, 20);
     }
@@ -772,11 +799,11 @@ static void drawDefinition()
 
 static void openDefinition(int idx)
 {
-    if (idx < 0 || idx >= WORD_COUNT) return;
+    if (idx < 0 || idx >= dictCount()) return;
     if (g_screen != SCR_DEFINITION && g_screen != SCR_HISTORY) g_prevScreen = g_screen;
     g_currentWord = idx;
     g_screen = SCR_DEFINITION;
-    pushHistory(WORDS[idx].term);
+    pushHistory(dictTerm(idx));
     drawDefinition();
 }
 
@@ -792,7 +819,7 @@ static void handleDefinition(const Tap& t)
     }
     // Star toggle
     if (inRect(t, SCREEN_W - DEF_STAR_W - 6, 4, DEF_STAR_W, HEADER_H - 8)) {
-        toggleFav(WORDS[g_currentWord].term);
+        toggleFav(dictTerm(g_currentWord));
         drawDefinition();
         return;
     }
@@ -845,6 +872,9 @@ void setup()
     initPalette();
     buildKeyboard();
 
+    // Load the dictionary source (SD corpus if present, else embedded set).
+    dictBegin();
+
     prefs.begin("dict", false);
     loadState();
 
@@ -860,7 +890,8 @@ void setup()
 
     buildResults();
     drawSearchScreen();
-    Serial.printf("CYD Dictionary ready: %d words\n", WORD_COUNT);
+    // esp_rom_printf reaches the USB-Serial/JTAG console (Serial is on UART0 here).
+    esp_rom_printf("[dict] ready: %s\n", dictStatus());
 }
 
 void loop()

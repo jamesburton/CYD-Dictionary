@@ -26,6 +26,16 @@
 #define TOUCH_I2C_ADDR 0x38
 #define TOUCH_I2C_PORT 0
 
+// --- SD card (SDMMC, 4-bit) ---
+// FNK0104AB pin set (from Freenove Sketch_06.1_SDMMC_Test). Distinct from the
+// display SPI and touch I2C, so the SD peripheral runs without bus contention.
+#define SD_CLK 38
+#define SD_CMD 40
+#define SD_D0  39
+#define SD_D1  41
+#define SD_D2  48
+#define SD_D3  47
+
 // --- Display geometry ---
 #define LCD_NATIVE_W 240
 #define LCD_NATIVE_H 320

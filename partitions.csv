@@ -1,0 +1,8 @@
+# CYD-Dictionary partition table for the 16 MB FNK0104.
+# 4 MB app + 8 MB LittleFS data (holds the ~5.1 MB built-in dictionary).
+# The data partition uses subtype/label "spiffs" so Arduino's LittleFS.begin()
+# (which defaults to partition label "spiffs") and PlatformIO's uploadfs find it.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000,
+factory,  app,  factory, 0x10000,  0x400000,
+spiffs,   data, spiffs,  0x410000, 0x800000,
