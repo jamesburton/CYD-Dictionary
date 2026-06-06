@@ -1,50 +1,61 @@
 #pragma once
 
 // ==============================================================================
-// Dictionary data source.
+// Dictionary data source (format v2: multiple meanings per word).
 //
-// Provides a uniform word interface backed by either:
-//   - the full Wordset corpus on the SD card (dict.idx + dict.dat), or
-//   - the embedded child-friendly starter set (WordData.h) as a fallback when no
-//     SD card / dictionary files are present.
+// Sources, in priority order: SD card override -> built-in LittleFS corpus ->
+// embedded fallback (WordData.h, single meaning). The active tier (Everyone or
+// Kids) selects which index file is used over the shared dict.dat.
 //
-// Terms live resident in PSRAM (loaded once from dict.idx), so prefix search and
-// browsing touch no I/O. Definitions are streamed from dict.dat on demand.
+// The index lives in PSRAM; meanings are streamed from dict.dat on demand.
 // ==============================================================================
 
 #include <Arduino.h>
+#include <vector>
+
+enum DictTier { TIER_EVERYONE = 0, TIER_KIDS = 1 };
+
+struct Meaning
+{
+    uint8_t posCode;   // 0 noun, 1 verb, 2 adjective, 3 adverb, 4 other
+    String  def;
+    String  example;   // "" if none
+};
 
 struct DictEntry
 {
-    String term;
-    String pos;       // part of speech
-    String def;       // definition
-    String example;   // example sentence ("" if none)
+    String                term;
+    std::vector<Meaning>  meanings;   // frequency-ordered
 };
 
-// Loads the dictionary from the first available source: SD card override, then
-// the built-in LittleFS corpus, then the embedded set. The index is read into
-// PSRAM. Returns true if a file-backed corpus loaded; false means the embedded
-// fallback is active.
-bool dictBegin();
+// Loads the dictionary for `tier` from the first available source. Returns true
+// if a file-backed corpus loaded; false means the embedded fallback is active.
+bool dictBegin(DictTier tier);
 
-// Human-readable source/diagnostic string, e.g. "Flash: 64645 words",
-// "SD: 64645 words", or "Flash ok, dict.idx missing". Shown on the More screen.
+// Switches the active tier by reloading its index over the already-open dict.dat.
+// Returns true on success. No-op-returns-false in embedded mode.
+bool dictSetTier(DictTier tier);
+
+// The currently active tier.
+DictTier dictTier();
+
+// Diagnostic string, e.g. "Flash (Everyone): 60123 words".
 const char* dictStatus();
 
 // Number of words in the active source.
 int dictCount();
 
-// Null-terminated lowercase term for index i. No I/O; pointer valid for the
-// whole session. Returns "" if i is out of range.
+// Null-terminated lowercase term for index i. No I/O; valid for the session.
 const char* dictTerm(int i);
 
-// Fills a full entry (term/pos/def/example) for index i, reading dict.dat in SD
-// mode. Returns false if i is out of range.
+// Fills a full entry (term + meanings) for index i. Returns false if out of range.
 bool dictGet(int i, DictEntry& e);
 
-// Binary search for an exact (lowercase) term. Returns its index, or -1.
+// Exact (lowercase) term lookup -> index, or -1.
 int dictFind(const char* term);
 
-// Index of the first term that is >= key (lowercase). Used to bound prefix scans.
+// First index whose term is >= key (lowercase). Bounds prefix scans.
 int dictLowerBound(const char* key);
+
+// Human-readable part of speech for a posCode ("noun", "verb", ...).
+const char* posName(uint8_t posCode);

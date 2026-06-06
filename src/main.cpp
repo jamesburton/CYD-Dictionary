@@ -435,15 +435,17 @@ static void drawPreview()
     }
     DictEntry w;
     dictGet(g_results[0], w);
+    if (w.meanings.empty()) return;
+    const Meaning& m0 = w.meanings[0];
     lcd.setFont(&fonts::Font4);
     int tw = lcd.textWidth(w.term);
     lcd.setTextColor(C_TEXT, C_BG);
     lcd.drawString(w.term, 10, top);
     lcd.setFont(&fonts::Font2);
     lcd.setTextColor(C_ACCENT, C_BG);
-    lcd.drawString(w.pos, 10 + tw + 8, top + 10);
+    lcd.drawString(posName(m0.posCode), 10 + tw + 8, top + 10);
     lcd.setTextColor(C_TEXT, C_BG);
-    drawWrapped(w.def, 10, top + 28, SCREEN_W - 20, 18);
+    drawWrapped(m0.def, 10, top + 28, SCREEN_W - 20, 18);
 }
 
 static void drawSearchScreen()
@@ -533,7 +535,7 @@ static void drawWordList(int total, const IndexAt& at, int offset)
         lcd.setTextColor(C_TEXT, C_ROW);
         lcd.drawString(w.term, 10, y + ROW_H / 2);
         lcd.setTextColor(C_SUB, C_ROW);
-        lcd.drawString(w.pos, listW - 70, y + ROW_H / 2);
+        lcd.drawString(w.meanings.empty() ? "" : posName(w.meanings[0].posCode), listW - 70, y + ROW_H / 2);
     }
 
     // Up / Down buttons on the right
@@ -753,14 +755,20 @@ static void handleMore(const Tap& t)
 // ----------------------------------------------------------------------------
 static const int DEF_BACK_W = 70;
 static const int DEF_STAR_W = 50;
+static const int DEF_BODY_TOP = HEADER_H;                 // body starts under the fixed header
+static const int DEF_VIEW_H   = SCREEN_H - DEF_BODY_TOP;  // viewport height (212)
+static const int DEF_SB_W     = 5;                        // scrollbar width
+static int g_defScroll = 0;                               // current scroll offset (px)
+static int g_defContentH = 0;                             // total content height (px), set by layout
 
-static void drawDefinition()
+// Drag-to-scroll state (declarations here so handleDefinition can reference them)
+static bool s_defDown = false;
+static int  s_defY0 = 0, s_defScroll0 = 0, s_defDownX = 0, s_defDownY = 0;
+static bool s_defDragged = false;
+
+// Draws the fixed top bar (Back + headword + favourite toggle).
+static void drawDefinitionHeader(const DictEntry& w)
 {
-    DictEntry w;
-    dictGet(g_currentWord, w);
-    lcd.fillScreen(C_BG);
-
-    // Top bar: Back + Star
     lcd.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
     lcd.fillRoundRect(6, 4, DEF_BACK_W, HEADER_H - 8, 6, C_ACCENT);
     lcd.setFont(&fonts::Font2);
@@ -769,32 +777,137 @@ static void drawDefinition()
     lcd.drawString("< Back", 6 + DEF_BACK_W / 2, HEADER_H / 2);
 
     bool fav = isFav(w.term);
-    lcd.fillRoundRect(SCREEN_W - DEF_STAR_W - 6, 4, DEF_STAR_W, HEADER_H - 8, 6,
-                      fav ? C_STAR : C_ACCENT);
+    lcd.fillRoundRect(SCREEN_W - DEF_STAR_W - 6, 4, DEF_STAR_W, HEADER_H - 8, 6, fav ? C_STAR : C_ACCENT);
     lcd.setTextColor(C_HEADERTX);
     lcd.drawString(fav ? "* in" : "+ fav", SCREEN_W - DEF_STAR_W / 2 - 6, HEADER_H / 2);
-    lcd.setTextDatum(textdatum_t::top_left);
 
-    // Headword + part of speech
-    int y = HEADER_H + 8;
+    // headword centred between the two buttons
     lcd.setFont(&fonts::Font4);
-    lcd.setTextColor(C_TEXT, C_BG);
-    lcd.drawString(w.term, 10, y);
-    y += 30;
-    lcd.setFont(&fonts::Font2);
-    lcd.setTextColor(C_ACCENT, C_BG);
-    lcd.drawString(w.pos, 10, y);
-    y += 22;
+    lcd.setTextColor(C_HEADERTX, C_HEADER);
+    lcd.drawString(w.term, SCREEN_W / 2, HEADER_H / 2);
+    lcd.setTextDatum(textdatum_t::top_left);
+}
 
-    // Definition
-    lcd.setTextColor(C_TEXT, C_BG);
-    y = drawWrapped(w.def, 10, y, SCREEN_W - 20, 20) + 6;
+// Lays out (and optionally draws) the grouped meanings starting at virtual y=0.
+// Returns total content height. When draw is true, content is offset by -g_defScroll
+// and clipped to the viewport. Groups meanings by POS in first-seen order.
+static int layoutDefinitionBody(const DictEntry& w, bool draw)
+{
+    const int x = 10;
+    const int maxw = SCREEN_W - DEF_SB_W - x - 6;
+    const int lineH = 20;
+    int vy = 0;   // virtual y (content space)
 
-    // Example
-    if (w.example.length()) {
-        lcd.setTextColor(C_SUB, C_BG);
-        drawWrapped(String("\"") + w.example + "\"", 10, y, SCREEN_W - 20, 20);
+    // unique POS codes in first-seen order
+    uint8_t order[8]; int nOrder = 0;
+    for (const auto& m : w.meanings) {
+        bool seen = false;
+        for (int k = 0; k < nOrder; ++k) if (order[k] == m.posCode) { seen = true; break; }
+        if (!seen && nOrder < 8) order[nOrder++] = m.posCode;
     }
+
+    auto drawLineWrapped = [&](const String& text, uint16_t color, int indent) {
+        // word-wrap `text` at the content width, emitting lines at (x+indent, screenY)
+        lcd.setFont(&fonts::Font2);
+        String line = "";
+        int start = 0;
+        int avail = maxw - indent;
+        while (start <= (int)text.length()) {
+            int sp = text.indexOf(' ', start);
+            String word = (sp < 0) ? text.substring(start) : text.substring(start, sp);
+            String trial = line.length() ? line + " " + word : word;
+            if (lcd.textWidth(trial) > avail && line.length()) {
+                if (draw) {
+                    int sy = DEF_BODY_TOP + vy - g_defScroll;
+                    if (sy + lineH > DEF_BODY_TOP && sy < SCREEN_H) {
+                        lcd.setTextColor(color, C_BG);
+                        lcd.drawString(line, x + indent, sy);
+                    }
+                }
+                vy += lineH;
+                line = word;
+            } else {
+                line = trial;
+            }
+            if (sp < 0) break;
+            start = sp + 1;
+        }
+        if (line.length()) {
+            if (draw) {
+                int sy = DEF_BODY_TOP + vy - g_defScroll;
+                if (sy + lineH > DEF_BODY_TOP && sy < SCREEN_H) {
+                    lcd.setTextColor(color, C_BG);
+                    lcd.drawString(line, x + indent, sy);
+                }
+            }
+            vy += lineH;
+        }
+    };
+
+    vy += 6;
+    for (int g = 0; g < nOrder; ++g) {
+        uint8_t pc = order[g];
+        // POS header
+        if (draw) {
+            int sy = DEF_BODY_TOP + vy - g_defScroll;
+            if (sy + 18 > DEF_BODY_TOP && sy < SCREEN_H) {
+                lcd.setFont(&fonts::Font2);
+                lcd.setTextColor(C_ACCENT, C_BG);
+                String h = String(posName(pc)); h.toUpperCase();
+                lcd.drawString(h, x, sy);
+            }
+        }
+        vy += 22;
+        // senses of this POS, numbered within the group
+        int n = 1;
+        for (const auto& m : w.meanings) {
+            if (m.posCode != pc) continue;
+            drawLineWrapped(String(n) + ".  " + m.def, C_TEXT, 0);
+            if (m.example.length()) drawLineWrapped(String("\"") + m.example + "\"", C_SUB, 14);
+            vy += 4;
+            ++n;
+        }
+        vy += 6;
+    }
+    return vy;
+}
+
+static int defMaxScroll()
+{
+    int m = g_defContentH - DEF_VIEW_H;
+    return m > 0 ? m : 0;
+}
+
+// Redraws just the scrolling body + scrollbar (header stays put).
+static void drawDefinitionBody()
+{
+    DictEntry w;
+    dictGet(g_currentWord, w);
+    lcd.fillRect(0, DEF_BODY_TOP, SCREEN_W, DEF_VIEW_H, C_BG);
+    lcd.setClipRect(0, DEF_BODY_TOP, SCREEN_W - DEF_SB_W, DEF_VIEW_H);
+    layoutDefinitionBody(w, true);
+    lcd.clearClipRect();
+
+    // scrollbar
+    int maxs = defMaxScroll();
+    if (maxs > 0) {
+        int trackX = SCREEN_W - DEF_SB_W;
+        lcd.fillRect(trackX, DEF_BODY_TOP, DEF_SB_W, DEF_VIEW_H, C_ROWLINE);
+        int thumbH = DEF_VIEW_H * DEF_VIEW_H / g_defContentH;
+        if (thumbH < 18) thumbH = 18;
+        int thumbY = DEF_BODY_TOP + (DEF_VIEW_H - thumbH) * g_defScroll / maxs;
+        lcd.fillRoundRect(trackX, thumbY, DEF_SB_W, thumbH, 2, C_ACCENT);
+    }
+}
+
+static void drawDefinition()
+{
+    DictEntry w;
+    dictGet(g_currentWord, w);
+    lcd.fillScreen(C_BG);
+    g_defContentH = layoutDefinitionBody(w, false);   // measure
+    drawDefinitionHeader(w);
+    drawDefinitionBody();
 }
 
 static void openDefinition(int idx)
@@ -802,6 +915,7 @@ static void openDefinition(int idx)
     if (idx < 0 || idx >= dictCount()) return;
     if (g_screen != SCR_DEFINITION && g_screen != SCR_HISTORY) g_prevScreen = g_screen;
     g_currentWord = idx;
+    g_defScroll = 0;
     g_screen = SCR_DEFINITION;
     pushHistory(dictTerm(idx));
     drawDefinition();
@@ -872,10 +986,12 @@ void setup()
     initPalette();
     buildKeyboard();
 
-    // Load the dictionary source (SD corpus if present, else embedded set).
-    dictBegin();
-
     prefs.begin("dict", false);
+
+    // Load the dictionary for the saved tier (SD corpus if present, else flash, else embedded).
+    DictTier startTier = (DictTier)prefs.getUChar("tier", TIER_EVERYONE);
+    dictBegin(startTier);
+
     loadState();
 
     // Touch calibration: apply stored transform, or run a one-time calibration.
