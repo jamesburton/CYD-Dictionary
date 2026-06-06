@@ -190,21 +190,21 @@ static String promptPin(const char* title)
     String entry = "";
     // 3x4 grid: 1..9, Cancel, 0, OK
     const char* labels[12] = {"1","2","3","4","5","6","7","8","9","Cancel","0","OK"};
-    int gw = 80, gh = 42, gap = 8;
+    int gw = 80, gh = 38, gap = 6;
     int gridW = gw * 3 + gap * 2;
     int x0 = (SCREEN_W - gridW) / 2;
-    int y0 = 70;
+    int y0 = 56;   // grid bottom = 56 + 4*38 + 3*6 = 226, fits the 240px screen
 
     auto redraw = [&]() {
         lcd.fillScreen(C_BG);
         lcd.setFont(&fonts::Font2);
         lcd.setTextColor(C_TEXT, C_BG);
         lcd.setTextDatum(textdatum_t::middle_center);
-        lcd.drawString(title, SCREEN_W / 2, 24);
+        lcd.drawString(title, SCREEN_W / 2, 18);
         // masked entry: entered digits shown as '*', remaining slots as '_'
         String shown = "";
         for (size_t i = 0; i < 4; ++i) shown += (i < entry.length() ? '*' : '_');
-        lcd.drawString(shown, SCREEN_W / 2, 48);
+        lcd.drawString(shown, SCREEN_W / 2, 40);
         for (int i = 0; i < 12; ++i) {
             int r = i / 3, c = i % 3;
             int bx = x0 + c * (gw + gap), by = y0 + r * (gh + gap);
@@ -238,13 +238,15 @@ static String promptPin(const char* title)
 // ----------------------------------------------------------------------------
 // On-screen keyboard model
 // ----------------------------------------------------------------------------
-enum KeyType { K_CHAR, K_BACK, K_SPACE, K_CLEAR };
+enum KeyType { K_CHAR, K_BACK };
 struct Key { int x, y, w, h; char c; KeyType type; };
 static std::vector<Key> g_keys;
 
-static const int KB_TOP = 122;
-static const int KEY_H  = 20;
-static const int ROW_PITCH = 22;
+// 3-row keyboard (single-word search needs no space/clear keys). Taller keys with
+// padding between rows and a gap above the tab bar for easier targeting.
+static const int KB_TOP = 116;
+static const int KEY_H  = 24;
+static const int ROW_PITCH = 30;
 
 static void addRow(const char* letters, int y)
 {
@@ -277,16 +279,6 @@ static void buildKeyboard()
         }
         g_keys.push_back({x + gap, y, bsw, KEY_H, 0, K_BACK});
     }
-
-    // Row 4: space + clear
-    {
-        int y = KB_TOP + ROW_PITCH * 3;
-        int spw = 200, clw = 80, gap = 8;
-        int total = spw + gap + clw;
-        int x = (SCREEN_W - total) / 2;
-        g_keys.push_back({x, y, spw, KEY_H, ' ', K_SPACE});
-        g_keys.push_back({x + spw + gap, y, clw, KEY_H, 0, K_CLEAR});
-    }
 }
 
 static void drawKey(const Key& k)
@@ -303,8 +295,6 @@ static void drawKey(const Key& k)
     switch (k.type) {
         case K_CHAR:  buf[0] = k.c; label = buf; break;
         case K_BACK:  label = "<-"; break;
-        case K_SPACE: label = "space"; break;
-        case K_CLEAR: label = "clear"; break;
     }
     lcd.drawString(label, k.x + k.w / 2, k.y + k.h / 2);
     lcd.setTextDatum(textdatum_t::top_left);
@@ -428,6 +418,12 @@ static void buildResults()
     }
 }
 
+// Clear (X) button inside the search field, shown only when there's a query.
+static const int SF_X_W = 24;
+static const int SF_X_X = SCREEN_W - 6 - SF_X_W - 2;   // left edge of the X button
+static const int SF_X_Y = 7;
+static const int SF_X_H = HEADER_H - 14;
+
 static void drawSearchField()
 {
     lcd.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
@@ -437,6 +433,11 @@ static void drawSearchField()
     if (g_query.length()) {
         lcd.setTextColor(C_TEXT, C_KEY);
         lcd.drawString(g_query + "_", 14, HEADER_H / 2);
+        // X clear button
+        lcd.fillRoundRect(SF_X_X, SF_X_Y, SF_X_W, SF_X_H, 4, C_ROWLINE);
+        lcd.setTextColor(C_TEXT, C_ROWLINE);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.drawString("x", SF_X_X + SF_X_W / 2, SF_X_Y + SF_X_H / 2);
     } else {
         lcd.setTextColor(C_SUB, C_KEY);
         lcd.drawString("Type a word...", 14, HEADER_H / 2);
@@ -519,6 +520,14 @@ static void handleSearch(const Tap& t)
 {
     if (handleTabBar(t)) return;
 
+    // Clear (X) button in the search field
+    if (g_query.length() && inRect(t, SF_X_X, SF_X_Y, SF_X_W, SF_X_H)) {
+        g_query = "";
+        buildResults();
+        drawSearchScreen();
+        return;
+    }
+
     // Suggestion chips
     for (auto& c : g_sugChips) {
         if (inRect(t, c.x, c.y, c.w, c.h)) { openDefinition(c.idx); return; }
@@ -537,9 +546,7 @@ static void handleSearch(const Tap& t)
             if (k.type == K_CHAR) drawKeyPopup(k);                 // tactile feedback
             switch (k.type) {
                 case K_CHAR:  if (g_query.length() < 24) g_query += k.c; break;
-                case K_SPACE: if (g_query.length() < 24) g_query += ' '; break;
                 case K_BACK:  if (g_query.length()) g_query.remove(g_query.length() - 1); break;
-                case K_CLEAR: g_query = ""; break;
             }
             if (k.type == K_CHAR) delay(110);                      // let the popup show
             buildResults();
@@ -853,6 +860,12 @@ static const int DEF_SB_W     = 5;                        // scrollbar width
 static int g_defScroll = 0;                               // current scroll offset (px)
 static int g_defContentH = 0;                             // total content height (px), set by layout
 
+// Off-screen content sprite (PSRAM) so scrolling is a single fast blit, not a
+// per-frame re-render. Rebuilt once when a definition opens; freed on leaving.
+static lgfx::LGFX_Sprite g_defSprite(&lcd);
+static bool g_defSpriteOk = false;
+static void freeDefSprite() { if (g_defSpriteOk) { g_defSprite.deleteSprite(); g_defSpriteOk = false; } }
+
 // Drag-to-scroll state (declarations here so handleDefinition can reference them)
 static bool s_defDown = false;
 static int  s_defY0 = 0, s_defScroll0 = 0, s_defDownX = 0, s_defDownY = 0;
@@ -880,15 +893,16 @@ static void drawDefinitionHeader(const DictEntry& w)
     lcd.setTextDatum(textdatum_t::top_left);
 }
 
-// Lays out (and optionally draws) the grouped meanings starting at virtual y=0.
-// Returns total content height. When draw is true, content is offset by -g_defScroll
-// and clipped to the viewport. Groups meanings by POS in first-seen order.
-static int layoutDefinitionBody(const DictEntry& w, bool draw)
+// Lays out the grouped meanings at content coords (origin 0,0). If g != nullptr,
+// draws into it; otherwise measures only. Returns total content height. Grouped by
+// POS in first-seen order. Drawing into a tall sprite lets scrolling be one blit.
+static int layoutDefinitionBody(const DictEntry& w, lgfx::LovyanGFX* g)
 {
+    lgfx::LovyanGFX* M = g ? g : static_cast<lgfx::LovyanGFX*>(&lcd);   // width metrics / draw target
     const int x = 10;
     const int maxw = SCREEN_W - DEF_SB_W - x - 6;
     const int lineH = 20;
-    int vy = 0;   // virtual y (content space)
+    int vy = 0;   // content-space y
 
     // unique POS codes in first-seen order
     uint8_t order[8]; int nOrder = 0;
@@ -899,8 +913,7 @@ static int layoutDefinitionBody(const DictEntry& w, bool draw)
     }
 
     auto drawLineWrapped = [&](const String& text, uint16_t color, int indent) {
-        // word-wrap `text` at the content width, emitting lines at (x+indent, screenY)
-        lcd.setFont(&fonts::Font2);
+        M->setFont(&fonts::Font2);
         String line = "";
         int start = 0;
         int avail = maxw - indent;
@@ -908,14 +921,8 @@ static int layoutDefinitionBody(const DictEntry& w, bool draw)
             int sp = text.indexOf(' ', start);
             String word = (sp < 0) ? text.substring(start) : text.substring(start, sp);
             String trial = line.length() ? line + " " + word : word;
-            if (lcd.textWidth(trial) > avail && line.length()) {
-                if (draw) {
-                    int sy = DEF_BODY_TOP + vy - g_defScroll;
-                    if (sy + lineH > DEF_BODY_TOP && sy < SCREEN_H) {
-                        lcd.setTextColor(color, C_BG);
-                        lcd.drawString(line, x + indent, sy);
-                    }
-                }
+            if (M->textWidth(trial) > avail && line.length()) {
+                if (g) { g->setTextColor(color, C_BG); g->drawString(line, x + indent, vy); }
                 vy += lineH;
                 line = word;
             } else {
@@ -925,32 +932,21 @@ static int layoutDefinitionBody(const DictEntry& w, bool draw)
             start = sp + 1;
         }
         if (line.length()) {
-            if (draw) {
-                int sy = DEF_BODY_TOP + vy - g_defScroll;
-                if (sy + lineH > DEF_BODY_TOP && sy < SCREEN_H) {
-                    lcd.setTextColor(color, C_BG);
-                    lcd.drawString(line, x + indent, sy);
-                }
-            }
+            if (g) { g->setTextColor(color, C_BG); g->drawString(line, x + indent, vy); }
             vy += lineH;
         }
     };
 
     vy += 6;
-    for (int g = 0; g < nOrder; ++g) {
-        uint8_t pc = order[g];
-        // POS header
-        if (draw) {
-            int sy = DEF_BODY_TOP + vy - g_defScroll;
-            if (sy + 18 > DEF_BODY_TOP && sy < SCREEN_H) {
-                lcd.setFont(&fonts::Font2);
-                lcd.setTextColor(C_ACCENT, C_BG);
-                String h = String(posName(pc)); h.toUpperCase();
-                lcd.drawString(h, x, sy);
-            }
+    for (int gi = 0; gi < nOrder; ++gi) {
+        uint8_t pc = order[gi];
+        if (g) {
+            g->setFont(&fonts::Font2);
+            g->setTextColor(C_ACCENT, C_BG);
+            String h = String(posName(pc)); h.toUpperCase();
+            g->drawString(h, x, vy);
         }
         vy += 22;
-        // senses of this POS, numbered within the group
         int n = 1;
         for (const auto& m : w.meanings) {
             if (m.posCode != pc) continue;
@@ -970,25 +966,29 @@ static int defMaxScroll()
     return m > 0 ? m : 0;
 }
 
-// Redraws just the scrolling body + scrollbar (header stays put).
+// Redraws just the scrolling body + scrollbar (header stays put). The body is one
+// blit of the pre-rendered content sprite, clipped to the viewport.
 static void drawDefinitionBody()
 {
-    DictEntry w;
-    dictGet(g_currentWord, w);
-    lcd.fillRect(0, DEF_BODY_TOP, SCREEN_W, DEF_VIEW_H, C_BG);
-    lcd.setClipRect(0, DEF_BODY_TOP, SCREEN_W - DEF_SB_W, DEF_VIEW_H);
-    layoutDefinitionBody(w, true);
-    lcd.clearClipRect();
+    int trackX = SCREEN_W - DEF_SB_W;
+    if (g_defSpriteOk) {
+        lcd.setClipRect(0, DEF_BODY_TOP, SCREEN_W - DEF_SB_W, DEF_VIEW_H);
+        g_defSprite.pushSprite(0, DEF_BODY_TOP - g_defScroll);
+        lcd.clearClipRect();
+    } else {
+        lcd.fillRect(0, DEF_BODY_TOP, SCREEN_W - DEF_SB_W, DEF_VIEW_H, C_BG);
+    }
 
     // scrollbar
     int maxs = defMaxScroll();
     if (maxs > 0) {
-        int trackX = SCREEN_W - DEF_SB_W;
         lcd.fillRect(trackX, DEF_BODY_TOP, DEF_SB_W, DEF_VIEW_H, C_ROWLINE);
         int thumbH = DEF_VIEW_H * DEF_VIEW_H / g_defContentH;
         if (thumbH < 18) thumbH = 18;
         int thumbY = DEF_BODY_TOP + (DEF_VIEW_H - thumbH) * g_defScroll / maxs;
         lcd.fillRoundRect(trackX, thumbY, DEF_SB_W, thumbH, 2, C_ACCENT);
+    } else {
+        lcd.fillRect(trackX, DEF_BODY_TOP, DEF_SB_W, DEF_VIEW_H, C_BG);
     }
 }
 
@@ -997,7 +997,22 @@ static void drawDefinition()
     DictEntry w;
     dictGet(g_currentWord, w);
     lcd.fillScreen(C_BG);
-    g_defContentH = layoutDefinitionBody(w, false);   // measure
+    g_defContentH = layoutDefinitionBody(w, nullptr);   // measure
+
+    // Render the whole body once into a PSRAM sprite for flicker-free scrolling.
+    freeDefSprite();
+    int sw = SCREEN_W - DEF_SB_W;
+    int sh = g_defContentH < DEF_VIEW_H ? DEF_VIEW_H : g_defContentH;
+    if (sh > 4000) sh = 4000;   // safety cap
+    g_defSprite.setColorDepth(16);
+    g_defSprite.setPsram(true);
+    g_defSpriteOk = (g_defSprite.createSprite(sw, sh) != nullptr);
+    if (g_defSpriteOk) {
+        g_defSprite.fillScreen(C_BG);
+        g_defSprite.setTextDatum(textdatum_t::top_left);
+        layoutDefinitionBody(w, &g_defSprite);
+    }
+
     drawDefinitionHeader(w);
     drawDefinitionBody();
 }
@@ -1019,6 +1034,7 @@ static void handleDefinition(const Tap& t)
 {
     // Back
     if (inRect(t, 6, 4, DEF_BACK_W, HEADER_H - 8)) {
+        freeDefSprite();                          // reclaim PSRAM
         g_screen = g_prevScreen;
         s_defDown = false; g_wasTouched = true;   // swallow this release on the next screen
         redrawCurrent();
