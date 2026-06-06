@@ -1,5 +1,6 @@
 # Offensive: unambiguous slurs (racial, ethnic, religious, homophobic, ableist, misogynistic) and strong profanity with no innocent dominant sense.
 # Excluded from Teen, Mild and Safe tiers (allowed in Full only). Homographs with a dominant innocent sense (cock, ass, spade, queer...) are intentionally NOT listed; their rude sense self-gates via definition vocabulary.
+apeshit
 arsehole
 arseholes
 asshole
@@ -32,10 +33,21 @@ faggot
 faggotry
 faggots
 fags
+fuck
+fucked
+fucker
+fuckers
+fuckface
+fuckin
+fucking
+fucks
+fudgepacker
 gook
 gooks
 goy
 goyim
+gyp
+gypped
 honkey
 honkies
 honky
@@ -52,18 +64,23 @@ kike
 kikes
 kraut
 krauts
+mick
+micks
+mong
 mongoloid
 motherfucker
 motherfuckers
 motherfucking
 negro
 negroes
+neonazi
 nigga
 niggas
 nigger
 niggers
 paki
 pakis
+pansy
 piccaninny
 pickaninny
 pikey
@@ -89,6 +106,10 @@ shithole
 shits
 shitting
 shitty
+skank
+skanks
+slag
+slags
 slanteye
 slut
 sluts
