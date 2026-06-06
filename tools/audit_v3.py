@@ -51,9 +51,16 @@ def main():
     def hw_floor(w):
         return FULL if w in offensive else TEEN if w in adult else MILD if w in mild else SAFE
 
+    # Words that are slurs/explicit as HEADWORDS but have an innocent verb/clinical
+    # sense in prose, so their appearance in a gloss is not harmful. Filtered as
+    # headwords still, but excluded from the gloss scan to avoid false hides
+    # (e.g. "anticoagulant ... retards the clotting").
+    GLOSS_EXCLUDE = {"retard", "retards", "retarded"}
+    gloss_core = core - GLOSS_EXCLUDE
+
     def core_floor(text):
         fl = SAFE
-        for t in set(WORD_RE.findall(text.lower())) & core:
+        for t in set(WORD_RE.findall(text.lower())) & gloss_core:
             fl = max(fl, FULL if t in offensive else TEEN)
         return fl
 
