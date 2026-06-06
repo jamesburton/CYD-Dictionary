@@ -928,6 +928,7 @@ static void handleDefinition(const Tap& t)
     // Back
     if (inRect(t, 6, 4, DEF_BACK_W, HEADER_H - 8)) {
         g_screen = g_prevScreen;
+        s_defDown = false; g_wasTouched = true;   // swallow this release on the next screen
         redrawCurrent();
         return;
     }
@@ -1010,8 +1011,40 @@ void setup()
     esp_rom_printf("[dict] ready: %s\n", dictStatus());
 }
 
+// Continuous touch handler for the definition screen: drag to scroll, tap (no
+// movement) falls through to handleDefinition() for Back / favourite.
+static void handleDefinitionTouch()
+{
+    int32_t x, y;
+    bool now = lcd.getTouch(&x, &y);
+    if (now && !s_defDown) {
+        s_defDown = true; s_defDragged = false;
+        s_defY0 = y; s_defScroll0 = g_defScroll; s_defDownX = x; s_defDownY = y;
+    } else if (now && s_defDown) {
+        int dy = s_defY0 - y;
+        if (abs(dy) > 6) s_defDragged = true;
+        if (s_defDragged) {
+            int ns = s_defScroll0 + dy;
+            if (ns < 0) ns = 0;
+            if (ns > defMaxScroll()) ns = defMaxScroll();
+            if (ns != g_defScroll) { g_defScroll = ns; drawDefinitionBody(); }
+        }
+    } else if (!now && s_defDown) {
+        s_defDown = false;
+        if (!s_defDragged) {
+            Tap t{true, s_defDownX, s_defDownY};
+            handleDefinition(t);   // Back / favourite hit-testing on the fixed header
+        }
+    }
+}
+
 void loop()
 {
+    if (g_screen == SCR_DEFINITION) {
+        handleDefinitionTouch();
+        delay(10);
+        return;
+    }
     Tap t = pollTap();
     if (t.hit) {
         switch (g_screen) {
@@ -1019,7 +1052,7 @@ void loop()
             case SCR_BROWSE:     handleBrowse(t); break;
             case SCR_SAVED:      handleSaved(t); break;
             case SCR_MORE:       handleMore(t); break;
-            case SCR_DEFINITION: handleDefinition(t); break;
+            case SCR_DEFINITION: break;   // handled above
             case SCR_HISTORY:    handleHistory(t); break;
         }
     }
