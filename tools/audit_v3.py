@@ -88,10 +88,24 @@ def main():
     bt = collections.Counter(NAME[wmin] for _, _, wmin in pushed)
     print("  by raised-to tier:", dict(bt))
     print(f"\nOVER-HIDE RISK (clean headword now hidden at Safe): {len(overhide)}")
-    for w, wmin in overhide[:40]:
-        print(f"    {w}  -> {NAME[wmin]}")
-    if len(overhide) > 40:
-        print(f"    ... +{len(overhide)-40} more")
+
+    # Frequency breakdown: how many of the residue are words a child might search?
+    try:
+        from wordfreq import zipf_frequency
+        bands = {">=4.0 (common)": 0, "3.0-4.0 (familiar)": 0, "2.0-3.0 (uncommon)": 0, "<2.0 (rare/technical)": 0}
+        common = []
+        for w, _ in overhide:
+            z = zipf_frequency(w, "en")
+            if z >= 4.0: bands[">=4.0 (common)"] += 1; common.append((w, z))
+            elif z >= 3.0: bands["3.0-4.0 (familiar)"] += 1; common.append((w, z))
+            elif z >= 2.0: bands["2.0-3.0 (uncommon)"] += 1
+            else: bands["<2.0 (rare/technical)"] += 1
+        print("  by word frequency (Zipf):")
+        for k, v in bands.items():
+            print(f"    {k:24} {v}")
+        print("  words >=3.0 (worth sanitising):", ", ".join(w for w, _ in sorted(common, key=lambda x: -x[1])))
+    except ImportError:
+        pass
     return 0
 
 
