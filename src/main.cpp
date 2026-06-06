@@ -180,6 +180,61 @@ static void pushHistory(const String& term)
     saveHistory();
 }
 
+static String getPin() { return prefs.getString("pin", ""); }
+static void   setPin(const String& p) { prefs.putString("pin", p); }
+
+// Blocking numeric keypad. Returns the entered 4-digit string, or "" if cancelled.
+// `title` is shown at the top.
+static String promptPin(const char* title)
+{
+    String entry = "";
+    // 3x4 grid: 1..9, Cancel, 0, OK
+    const char* labels[12] = {"1","2","3","4","5","6","7","8","9","Cancel","0","OK"};
+    int gw = 80, gh = 42, gap = 8;
+    int gridW = gw * 3 + gap * 2;
+    int x0 = (SCREEN_W - gridW) / 2;
+    int y0 = 70;
+
+    auto redraw = [&]() {
+        lcd.fillScreen(C_BG);
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextColor(C_TEXT, C_BG);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.drawString(title, SCREEN_W / 2, 24);
+        // masked entry: entered digits shown as '*', remaining slots as '_'
+        String shown = "";
+        for (size_t i = 0; i < 4; ++i) shown += (i < entry.length() ? '*' : '_');
+        lcd.drawString(shown, SCREEN_W / 2, 48);
+        for (int i = 0; i < 12; ++i) {
+            int r = i / 3, c = i % 3;
+            int bx = x0 + c * (gw + gap), by = y0 + r * (gh + gap);
+            uint16_t col = (i == 9) ? C_SUB : (i == 11 ? C_ACCENT : C_KEY);
+            uint16_t tx = (i == 9 || i == 11) ? C_HEADERTX : C_KEYTX;
+            lcd.fillRoundRect(bx, by, gw, gh, 6, col);
+            lcd.setTextColor(tx, col);
+            lcd.drawString(labels[i], bx + gw / 2, by + gh / 2);
+        }
+        lcd.setTextDatum(textdatum_t::top_left);
+    };
+    redraw();
+
+    g_wasTouched = true;   // ignore the press that opened this modal
+    for (;;) {
+        Tap t = pollTap();
+        if (!t.hit) { delay(10); continue; }
+        for (int i = 0; i < 12; ++i) {
+            int r = i / 3, c = i % 3;
+            int bx = x0 + c * (gw + gap), by = y0 + r * (gh + gap);
+            if (inRect(t, bx, by, gw, gh)) {
+                if (i == 9) return "";                       // Cancel
+                if (i == 11) return entry;                   // OK
+                char d = labels[i][0];
+                if (entry.length() < 4) { entry += d; redraw(); }
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // On-screen keyboard model
 // ----------------------------------------------------------------------------
