@@ -23,7 +23,7 @@ static Preferences prefs;
 // ----------------------------------------------------------------------------
 static uint16_t C_BG, C_HEADER, C_HEADERTX, C_TEXT, C_SUB, C_KEY, C_KEYTX,
     C_ACCENT, C_TABBAR, C_TABTX, C_TABON, C_ROW, C_ROWLINE, C_WOD, C_WODBORD, C_STAR,
-    C_KEYDIM, C_KEYDIMTX;
+    C_KEYDIM, C_KEYDIMTX, C_DANGER;
 
 static void initPalette()
 {
@@ -45,6 +45,7 @@ static void initPalette()
     C_STAR     = lcd.color565(245, 190, 60);
     C_KEYDIM   = lcd.color565(214, 220, 224);
     C_KEYDIMTX = lcd.color565(176, 184, 190);
+    C_DANGER   = lcd.color565(220, 53, 69);
 }
 
 // ----------------------------------------------------------------------------
@@ -419,10 +420,10 @@ static void buildResults()
 }
 
 // Clear (X) button inside the search field, shown only when there's a query.
-static const int SF_X_W = 24;
+static const int SF_X_W = 34;
 static const int SF_X_X = SCREEN_W - 6 - SF_X_W - 2;   // left edge of the X button
-static const int SF_X_Y = 7;
-static const int SF_X_H = HEADER_H - 14;
+static const int SF_X_Y = 5;
+static const int SF_X_H = HEADER_H - 10;
 
 static void drawSearchField()
 {
@@ -433,11 +434,11 @@ static void drawSearchField()
     if (g_query.length()) {
         lcd.setTextColor(C_TEXT, C_KEY);
         lcd.drawString(g_query + "_", 14, HEADER_H / 2);
-        // X clear button
-        lcd.fillRoundRect(SF_X_X, SF_X_Y, SF_X_W, SF_X_H, 4, C_ROWLINE);
-        lcd.setTextColor(C_TEXT, C_ROWLINE);
+        // X clear button (red)
+        lcd.fillRoundRect(SF_X_X, SF_X_Y, SF_X_W, SF_X_H, 5, C_DANGER);
+        lcd.setTextColor(C_HEADERTX, C_DANGER);
         lcd.setTextDatum(textdatum_t::middle_center);
-        lcd.drawString("x", SF_X_X + SF_X_W / 2, SF_X_Y + SF_X_H / 2);
+        lcd.drawString("X", SF_X_X + SF_X_W / 2, SF_X_Y + SF_X_H / 2);
     } else {
         lcd.setTextColor(C_SUB, C_KEY);
         lcd.drawString("Type a word...", 14, HEADER_H / 2);
