@@ -9,28 +9,35 @@
 #include <string.h>
 
 // ----------------------------------------------------------------------------
-// State. Index buffers live in PSRAM and are freed/reloaded on tier change;
-// the shared dict.dat handle and source FS stay open across tier switches.
+// State.
+//
+// Full index (ALL words from dict.idx) lives in s_idx (raw file bytes in PSRAM)
+// with parallel arrays s_allTerm / s_allOff / s_allMin (also PSRAM). These are
+// populated once in dictBegin() and stay until the next dictBegin().
+//
+// The filtered view (words whose wordMinTier <= s_tier) is kept in s_term /
+// s_dataOff (PSRAM). Rebuilt quickly in rebuildTierView() on every tier switch,
+// without re-reading dict.dat.
 // ----------------------------------------------------------------------------
 static bool          s_loaded   = false;
 static fs::FS*       s_fs       = nullptr;   // source filesystem (SD_MMC or LittleFS)
-static uint8_t*      s_idx      = nullptr;   // current index file (PSRAM)
-static const char**  s_term     = nullptr;   // term pointers into s_idx (PSRAM)
-static uint32_t*     s_dataOff  = nullptr;   // dict.dat offset per entry (PSRAM)
+
+// Full index arrays (all entries, never filtered)
+static uint8_t*      s_idx      = nullptr;   // raw dict.idx bytes in PSRAM
+static const char**  s_allTerm  = nullptr;   // term pointers into s_idx (PSRAM)
+static uint32_t*     s_allOff   = nullptr;   // dict.dat offset per entry (PSRAM)
+static uint8_t*      s_allMin   = nullptr;   // wordMinTier per entry (PSRAM)
+static int           s_allCount = 0;
+
+// Filtered view (entries where s_allMin[i] <= s_tier)
+static const char**  s_term     = nullptr;   // PSRAM
+static uint32_t*     s_dataOff  = nullptr;   // PSRAM
 static int           s_count    = 0;
+
 static File          s_dat;                  // shared dict.dat handle
 static DictTier      s_tier     = TIER_FULL;
 static char          s_status[64] = "Built-in set";
 
-static const char* tierIdxPath(DictTier t)
-{
-    switch (t) {
-        case TIER_SAFE: return "/dict_safe.idx";
-        case TIER_MILD: return "/dict_mild.idx";
-        case TIER_TEEN: return "/dict_teen.idx";
-        default:        return "/dict_full.idx";
-    }
-}
 static const char* tierName(DictTier t)
 {
     switch (t) {
@@ -43,12 +50,23 @@ static const char* tierName(DictTier t)
 
 static void setStatus(const char* msg) { strncpy(s_status, msg, sizeof(s_status) - 1); s_status[sizeof(s_status) - 1] = 0; }
 
-static void freeIndex()
+// Frees only the filtered-view arrays; leaves the full index intact.
+static void freeFiltered()
 {
-    if (s_idx)     { heap_caps_free(s_idx);     s_idx = nullptr; }
-    if (s_term)    { heap_caps_free(s_term);    s_term = nullptr; }
+    if (s_term)    { heap_caps_free(s_term);    s_term    = nullptr; }
     if (s_dataOff) { heap_caps_free(s_dataOff); s_dataOff = nullptr; }
     s_count = 0;
+}
+
+// Frees everything: full index + filtered view.
+static void freeAll()
+{
+    freeFiltered();
+    if (s_allTerm) { heap_caps_free(s_allTerm); s_allTerm = nullptr; }
+    if (s_allOff)  { heap_caps_free(s_allOff);  s_allOff  = nullptr; }
+    if (s_allMin)  { heap_caps_free(s_allMin);  s_allMin  = nullptr; }
+    if (s_idx)     { heap_caps_free(s_idx);      s_idx     = nullptr; }
+    s_allCount = 0;
 }
 
 static String readField(uint32_t len)
@@ -61,12 +79,49 @@ static String readField(uint32_t len)
     return String(buf);
 }
 
-// Loads an index file from s_fs into PSRAM, replacing any current index.
-static bool loadIndex(const char* idxPath, const char* tag)
+// Builds (or rebuilds) the filtered view from the full index for the current
+// s_tier. Called after loading the full index and on every tier switch.
+static bool rebuildTierView()
+{
+    freeFiltered();
+    if (s_allCount == 0) return true;   // empty corpus is valid
+
+    // Count how many entries pass the filter.
+    int filtered = 0;
+    for (int i = 0; i < s_allCount; ++i) {
+        if (s_allMin[i] <= (uint8_t)s_tier) ++filtered;
+    }
+
+    if (filtered > 0) {
+        s_term    = static_cast<const char**>(heap_caps_malloc(sizeof(char*)    * filtered, MALLOC_CAP_SPIRAM));
+        s_dataOff = static_cast<uint32_t*>  (heap_caps_malloc(sizeof(uint32_t) * filtered, MALLOC_CAP_SPIRAM));
+        if (!s_term || !s_dataOff) {
+            setStatus("PSRAM alloc failed (filter)");
+            freeFiltered();
+            return false;
+        }
+    }
+
+    // Fill in sorted order (s_all* is already sorted, so the filtered subset stays sorted).
+    int j = 0;
+    for (int i = 0; i < s_allCount; ++i) {
+        if (s_allMin[i] <= (uint8_t)s_tier) {
+            s_term[j]    = s_allTerm[i];
+            s_dataOff[j] = s_allOff[i];
+            ++j;
+        }
+    }
+    s_count = filtered;
+    return true;
+}
+
+// Reads dict.idx from s_fs into PSRAM and builds the full index arrays.
+// Version must be 3. Sets a status string and returns false on any error.
+static bool loadFullIndex(const char* tag)
 {
     char st[64];
-    File f = s_fs->open(idxPath, FILE_READ);
-    if (!f) { snprintf(st, sizeof(st), "%s: %s missing", tag, idxPath); setStatus(st); return false; }
+    File f = s_fs->open("/dict.idx", FILE_READ);
+    if (!f) { snprintf(st, sizeof(st), "%s: dict.idx missing", tag); setStatus(st); return false; }
 
     size_t sz = f.size();
     uint8_t* idx = static_cast<uint8_t*>(heap_caps_malloc(sz, MALLOC_CAP_SPIRAM));
@@ -79,29 +134,36 @@ static bool loadIndex(const char* idxPath, const char* tag)
     uint32_t version = 0, count = 0;
     memcpy(&version, idx + 4, 4);
     memcpy(&count,   idx + 8, 4);
-    if (version != 2) { snprintf(st, sizeof(st), "%s: idx version %u", tag, (unsigned)version); setStatus(st); heap_caps_free(idx); return false; }
-
-    const char** term    = static_cast<const char**>(heap_caps_malloc(sizeof(char*) * count, MALLOC_CAP_SPIRAM));
-    uint32_t*    dataOff = static_cast<uint32_t*>(heap_caps_malloc(sizeof(uint32_t) * count, MALLOC_CAP_SPIRAM));
-    if (!term || !dataOff) {
-        snprintf(st, sizeof(st), "%s: PSRAM alloc failed", tag); setStatus(st);
-        heap_caps_free(idx); heap_caps_free(term); heap_caps_free(dataOff);
+    if (version != 3) {
+        snprintf(st, sizeof(st), "%s: idx version %u", tag, (unsigned)version);
+        setStatus(st);
+        heap_caps_free(idx);
         return false;
     }
 
+    const char** allTerm = static_cast<const char**>(heap_caps_malloc(sizeof(char*)    * count, MALLOC_CAP_SPIRAM));
+    uint32_t*    allOff  = static_cast<uint32_t*>  (heap_caps_malloc(sizeof(uint32_t) * count, MALLOC_CAP_SPIRAM));
+    uint8_t*     allMin  = static_cast<uint8_t*>   (heap_caps_malloc(sizeof(uint8_t)  * count, MALLOC_CAP_SPIRAM));
+    if (!allTerm || !allOff || !allMin) {
+        snprintf(st, sizeof(st), "%s: PSRAM alloc failed", tag); setStatus(st);
+        heap_caps_free(idx); heap_caps_free(allTerm); heap_caps_free(allOff); heap_caps_free(allMin);
+        return false;
+    }
+
+    // Parse entries: [u32 dataOffset][u8 wordMinTier][term\0]
     size_t p = 12;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t off; memcpy(&off, idx + p, 4); p += 4;
-        dataOff[i] = off;
-        term[i] = reinterpret_cast<const char*>(idx + p);
+        allOff[i]  = off;
+        allMin[i]  = idx[p]; ++p;                                   // wordMinTier byte
+        allTerm[i] = reinterpret_cast<const char*>(idx + p);
         while (idx[p] != 0) ++p;
-        ++p;
+        ++p;   // skip NUL terminator
     }
 
-    freeIndex();
-    s_idx = idx; s_term = term; s_dataOff = dataOff; s_count = static_cast<int>(count);
-    snprintf(st, sizeof(st), "%s: %d words", tag, s_count);
-    setStatus(st);
+    freeAll();
+    s_idx = idx; s_allTerm = allTerm; s_allOff = allOff; s_allMin = allMin;
+    s_allCount = static_cast<int>(count);
     return true;
 }
 
@@ -129,18 +191,28 @@ bool dictBegin(DictTier tier)
 {
     s_tier = tier;
     if (!openSource()) { s_loaded = false; setStatus("Built-in set"); return false; }
-    char tag[24]; snprintf(tag, sizeof(tag), "%s (%s)", (s_fs == &SD_MMC ? "SD" : "Flash"), tierName(tier));
-    if (!loadIndex(tierIdxPath(tier), tag)) { s_loaded = false; return false; }
+
+    const char* srcTag = (s_fs == &SD_MMC) ? "SD" : "Flash";
+    if (!loadFullIndex(srcTag)) { s_loaded = false; return false; }
+
+    if (!rebuildTierView()) { s_loaded = false; return false; }
+
     s_loaded = true;
+    char st[64];
+    snprintf(st, sizeof(st), "%s: %d words (%s)", srcTag, s_count, tierName(tier));
+    setStatus(st);
     return true;
 }
 
 bool dictSetTier(DictTier tier)
 {
     if (!s_loaded || !s_fs) return false;
-    char tag[24]; snprintf(tag, sizeof(tag), "%s (%s)", (s_fs == &SD_MMC ? "SD" : "Flash"), tierName(tier));
-    if (!loadIndex(tierIdxPath(tier), tag)) return false;
     s_tier = tier;
+    if (!rebuildTierView()) return false;
+    char st[64];
+    const char* srcTag = (s_fs == &SD_MMC) ? "SD" : "Flash";
+    snprintf(st, sizeof(st), "%s: %d words (%s)", srcTag, s_count, tierName(tier));
+    setStatus(st);
     return true;
 }
 
@@ -171,7 +243,11 @@ bool dictGet(int i, DictEntry& e)
 
     if (!s_loaded) {
         e.term = WORDS[i].term;
-        Meaning m; m.posCode = posCodeFromName(WORDS[i].pos); m.def = WORDS[i].def; m.example = WORDS[i].example;
+        Meaning m;
+        m.minTier = 0; m.maxTier = 3;   // embedded words are always visible
+        m.posCode = posCodeFromName(WORDS[i].pos);
+        m.def = WORDS[i].def;
+        m.example = WORDS[i].example;
         e.meanings.push_back(m);
         return true;
     }
@@ -179,14 +255,31 @@ bool dictGet(int i, DictEntry& e)
     e.term = s_term[i];
     if (!s_dat) return false;
     s_dat.seek(s_dataOff[i]);
+
     uint8_t n = 0;
     s_dat.read(&n, 1);
+
     for (uint8_t k = 0; k < n; ++k) {
-        Meaning m;
-        uint8_t pc = 0; s_dat.read(&pc, 1); m.posCode = pc;
-        uint16_t dl = 0; s_dat.read(reinterpret_cast<uint8_t*>(&dl), 2); m.def = readField(dl);
-        uint16_t el = 0; s_dat.read(reinterpret_cast<uint8_t*>(&el), 2); m.example = readField(el);
-        e.meanings.push_back(m);
+        // Read ALL fields first (keeps the file pointer in sync even for filtered meanings).
+        uint8_t tierRange = 0; s_dat.read(&tierRange, 1);
+        uint8_t pc = 0;        s_dat.read(&pc, 1);
+        uint16_t dl = 0;       s_dat.read(reinterpret_cast<uint8_t*>(&dl), 2);
+        String def = readField(dl);
+        uint16_t el = 0;       s_dat.read(reinterpret_cast<uint8_t*>(&el), 2);
+        String ex = readField(el);
+
+        uint8_t minT = tierRange & 3;
+        uint8_t maxT = (tierRange >> 2) & 3;
+
+        // Only include this meaning if the active tier falls within its range.
+        if (minT <= (uint8_t)s_tier && (uint8_t)s_tier <= maxT) {
+            Meaning m;
+            m.minTier = minT; m.maxTier = maxT;
+            m.posCode = pc;
+            m.def = def;
+            m.example = ex;
+            e.meanings.push_back(m);
+        }
     }
     return true;
 }
