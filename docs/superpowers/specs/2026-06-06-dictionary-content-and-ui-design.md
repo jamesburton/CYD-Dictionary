@@ -23,6 +23,38 @@ unsuitable for the user's 8-year-old son.
 Non-goals: perfect word-sense frequency ranking (WordNet's is good-enough and iterable);
 audio; online lookup.
 
+## Revision: four-tier model (supersedes Everyone/Kids)
+
+Filtering is driven by three curated category word lists (single lowercase a-z
+words, one per line, `#` comments) under `tools/`:
+- `words_offensive.txt` — strong profanity + slurs (183)
+- `words_adult.txt` — sexual / explicit (224)
+- `words_mild.txt` — naughty / slightly rude (75)
+
+Four tiers, defined by which categories they exclude (most → least restrictive):
+
+| Tier | enum value      | excludes                          |
+|------|-----------------|-----------------------------------|
+| Safe | `TIER_SAFE = 0` | offensive + adult + mild          |
+| Mild | `TIER_MILD = 1` | offensive + adult                 |
+| Teen | `TIER_TEEN = 2` | offensive                         |
+| Full | `TIER_FULL = 3` | (nothing)                         |
+
+**Storage:** `dict.dat` holds ALL words (the Full set, multi-meaning). Four index
+files share it, each a strict subset (safe ⊆ mild ⊆ teen ⊆ full) pointing into the
+same `dict.dat` offsets: `dict_safe.idx`, `dict_mild.idx`, `dict_teen.idx`,
+`dict_full.idx`.
+
+**Firmware:** `enum DictTier { TIER_SAFE=0, TIER_MILD=1, TIER_TEEN=2, TIER_FULL=3 }`.
+`tierIdxPath()` maps tier→filename; `tierName()`→"Safe"/"Mild"/"Teen"/"Full".
+Default tier `TIER_FULL` (NVS key `tier`, 0–3). The More screen shows a 4-way
+selector. The **PIN lock gates moving to a *more permissive* tier** (higher index)
+than the current one; moving to a more restrictive tier is always allowed. Set /
+clear PIN as before (empty = no lock).
+
+**Generator & verifier** updated accordingly. The old `blocklist_profanity.txt` /
+`blocklist_sensitive.txt` are replaced by the three category lists.
+
 ## Data source & pipeline
 
 **Source: WordNet** (via `nltk`), with **`wordfreq`** for word-level frequency.
