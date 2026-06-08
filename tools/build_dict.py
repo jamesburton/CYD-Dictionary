@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Build the on-device dictionary from WordNet (format v3).
+Build the on-device base dictionary from WordNet (format v4).
 
 Source : WordNet via nltk (auto-downloaded on first run).
-Output : data/dict.idx    (single index; entry includes wordMinTier)
-         data/dict.dat    (all words with per-meaning tierRange)
+Output : data/dicts/base.idx    (single index; entry includes wordMinTier)
+         data/dicts/base.dat    (all words with display headword + per-meaning tierRange)
+         data/dicts/base.meta   (name/version/mode/floor/format=4)
 
 Tier constants (SAFE=0, MILD=1, TEEN=2, FULL=3):
   - wordMinTier = min(minTier) over all meanings; written in the index.
@@ -21,19 +22,23 @@ Optional input files (tools/, TSV, skipped gracefully if absent):
   sense_labels.tsv     word<TAB>def_prefix<TAB>minTierName
   overrides.tsv        word<TAB>def_prefix<TAB>sanitised_def[<TAB>sanitised_ex]
 
-Format v3 (little-endian, matches firmware):
+Format v4 (little-endian, matches firmware):
 
-  data/dict.idx
-    "DIDX" | u32 version=3 | u32 count
-    per entry: [u32 dataOffset][u8 wordMinTier][term ascii][0x00]
-    terms lowercase a-z, sorted ascending.
+  data/dicts/base.idx
+    "DIDX" | u32 version=4 | u32 count
+    per entry: [u32 dataOffset][u8 wordMinTier][normalised-key ascii][0x00]
+    keys sorted ascending.
 
-  data/dict.dat
+  data/dicts/base.dat
     per entry at dataOffset:
+      u8 dispLen + display bytes (display headword)
       u8 nMeanings
       nMeanings x [u8 tierRange][u8 posCode][u16 defLen][def][u16 exLen][example]
     tierRange = minTier | (maxTier<<2)  (each 2 bits, 0..3)
     posCode: 0 noun, 1 verb, 2 adjective, 3 adverb, 4 other
+
+  data/dicts/base.meta
+    text key=value lines: name, version, mode, floor, format=4
 """
 
 import os
@@ -41,10 +46,12 @@ import re
 import struct
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = os.path.join(os.path.dirname(HERE), "data")
+from normalize import norm_key
 
-VERSION = 3
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = os.path.join(os.path.dirname(HERE), "data", "dicts")
+
+VERSION = 4
 SENSE_CAP = int(os.environ.get("DICT_SENSE_CAP", "8"))  # max meanings per word (size lever)
 MAX_DEF = 240
 MAX_EX = 160
@@ -227,15 +234,20 @@ def apply_overrides(words, override_rows, offensive, adult, mild_list):
                 break
 
 
-def write_idx(path, terms, offsets, word_min_tiers):
-    """Write a v3 index file: DIDX | u32 version=3 | u32 count | entries."""
+def write_idx(path, words, offsets, wordmin):
+    """Write a v4 index file: DIDX | u32 version=4 | u32 count | entries (normalised key)."""
     with open(path, "wb") as f:
-        f.write(b"DIDX")
-        f.write(struct.pack("<II", VERSION, len(terms)))
-        for t in terms:
-            f.write(struct.pack("<I", offsets[t]))          # u32 dataOffset
-            f.write(struct.pack("<B", word_min_tiers[t]))   # u8 wordMinTier
-            f.write(t.encode("ascii") + b"\x00")            # term + NUL
+        f.write(b"DIDX"); f.write(struct.pack("<II", VERSION, len(words)))
+        for w in words:
+            f.write(struct.pack("<I", offsets[w]))
+            f.write(struct.pack("<B", wordmin[w]))
+            f.write(norm_key(w).encode("ascii") + b"\x00")   # key
+
+
+def write_meta(path, name, mode, floor):
+    """Write a .meta file (text key=value) for the dictionary."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"name={name}\nversion=dict-2026.06\nmode={mode}\nfloor={floor}\nformat=4\n")
 
 
 def main():
@@ -293,14 +305,16 @@ def main():
     terms = sorted(words)
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    dat_path = os.path.join(OUT_DIR, "dict.dat")
+    dat_path = os.path.join(OUT_DIR, "base.dat")
 
-    # Write all terms to dict.dat and record their offsets.
+    # Write all terms to base.dat and record their offsets.
     offsets = {}
     with open(dat_path, "wb") as dat:
         for t in terms:
             offsets[t] = dat.tell()
             ms = words[t]
+            disp = t.encode("utf-8")[:255]
+            dat.write(struct.pack("<B", len(disp)) + disp)   # display headword
             dat.write(struct.pack("<B", len(ms)))   # u8 nMeanings
             for pc, d, ex, min_t, max_t in ms:
                 tier_range = min_t | (max_t << 2)
@@ -311,20 +325,26 @@ def main():
                 dat.write(struct.pack("<H", len(db)) + db) # u16 defLen + def
                 dat.write(struct.pack("<H", len(eb)) + eb) # u16 exLen + example
 
-    # Write the single v3 index file.
-    idx_path = os.path.join(OUT_DIR, "dict.idx")
+    # Write the v4 index file.
+    idx_path = os.path.join(OUT_DIR, "base.idx")
     write_idx(idx_path, terms, offsets, word_min_tiers)
+
+    # Write the meta file.
+    meta_path = os.path.join(OUT_DIR, "base.meta")
+    write_meta(meta_path, "Base (WordNet)", "additive", "safe")
 
     # Report sizes.
     dat_sz = os.path.getsize(dat_path)
     idx_sz = os.path.getsize(idx_path)
-    total = dat_sz + idx_sz
+    meta_sz = os.path.getsize(meta_path)
+    total = dat_sz + idx_sz + meta_sz
 
     # Simulated per-tier visible word counts (wordMinTier <= activeTier).
     tier_counts = {t: sum(1 for wmt in word_min_tiers.values() if wmt <= t) for t in (SAFE, MILD, TEEN, FULL)}
 
-    print(f"Wrote data/dict.dat  ({dat_sz:,} bytes)")
-    print(f"Wrote data/dict.idx  ({idx_sz:,} bytes)")
+    print(f"Wrote data/dicts/base.dat  ({dat_sz:,} bytes)")
+    print(f"Wrote data/dicts/base.idx  ({idx_sz:,} bytes)")
+    print(f"Wrote data/dicts/base.meta ({meta_sz:,} bytes)")
     print(f"Total {total / 1048576:.2f} MB.  Flash with: pio run -t uploadfs")
     print(
         f"Visible at tiers — Safe: {tier_counts[SAFE]:,}  Mild: {tier_counts[MILD]:,}  "
