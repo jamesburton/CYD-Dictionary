@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Parse data/dict.idx + data/dict.dat (format v3) and assert correctness.
+Parse data/dicts/base.idx + base.dat + base.meta (format v4) and assert correctness.
 Exits non-zero on any failure.
 
 Checks:
-  - Index magic "DIDX" and version == 3.
-  - Terms are sorted ascending.
+  - Index magic "DIDX" and version == 4.
+  - Keys are sorted ascending.
   - For each entry, wordMinTier == min(meaning.minTier).
   - Every meaning has minTier <= maxTier.
-  - Total file size (dict.idx + dict.dat) <= 14 MB.
+  - Display headword is non-empty.
+  - Total file size (base.idx + base.dat + base.meta) <= 14 MB.
   - Spot-checks: blue/toy/mouse primary senses print correctly.
   - "fuck" (an offensive headword) has wordMinTier == FULL.
   - If any override-appended meanings exist (maxTier < FULL), at least one
@@ -20,8 +21,10 @@ import os
 import struct
 import sys
 
+from normalize import norm_key
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(os.path.dirname(HERE), "data")
+DATA = os.path.join(os.path.dirname(HERE), "data", "dicts")
 
 POS = {0: "noun", 1: "verb", 2: "adjective", 3: "adverb", 4: "other"}
 
@@ -35,17 +38,17 @@ TIER_NAMES = {SAFE: "Safe", MILD: "Mild", TEEN: "Teen", FULL: "Full"}
 
 def read_idx(path):
     """
-    Parse a v3 index file.
-    Returns (terms, data_offsets, word_min_tiers) — all parallel lists.
+    Parse a v4 index file.
+    Returns (keys, data_offsets, word_min_tiers) — all parallel lists.
     """
     with open(path, "rb") as fh:
         b = fh.read()
 
     assert b[:4] == b"DIDX", f"{path}: bad magic (got {b[:4]!r})"
     version, count = struct.unpack_from("<II", b, 4)
-    assert version == 3, f"{path}: version {version} != 3"
+    assert version == 4, f"{path}: version {version} != 4"
 
-    terms = []
+    keys = []
     data_offsets = []
     word_min_tiers = []
     p = 12
@@ -54,20 +57,22 @@ def read_idx(path):
         off = struct.unpack_from("<I", b, p)[0]; p += 4
         wmt = b[p]; p += 1                                # u8 wordMinTier
         nul = b.index(b"\x00", p)
-        terms.append(b[p:nul].decode("ascii"))
+        keys.append(b[p:nul].decode("ascii"))             # normalised key
         data_offsets.append(off)
         word_min_tiers.append(wmt)
         p = nul + 1
 
-    return terms, data_offsets, word_min_tiers
+    return keys, data_offsets, word_min_tiers
 
 
 def read_entry(dat_bytes, off):
     """
-    Parse one dict.dat entry.
-    Returns list of (posCode, definition, example, minTier, maxTier).
+    Parse one base.dat entry (v4).
+    Returns (display, list of (posCode, definition, example, minTier, maxTier)).
     """
     p = off
+    disp_len = dat_bytes[p]; p += 1
+    display = dat_bytes[p:p + disp_len].decode("utf-8", "replace"); p += disp_len
     n = dat_bytes[p]; p += 1
     meanings = []
     for _ in range(n):
@@ -80,20 +85,21 @@ def read_entry(dat_bytes, off):
         el = struct.unpack_from("<H", dat_bytes, p)[0]; p += 2
         ex = dat_bytes[p:p + el].decode("utf-8", "replace"); p += el
         meanings.append((pc, d, ex, min_tier, max_tier))
-    return meanings
+    return display, meanings
 
 
 def main():
-    idx_path = os.path.join(DATA, "dict.idx")
-    dat_path = os.path.join(DATA, "dict.dat")
+    idx_path = os.path.join(DATA, "base.idx")
+    dat_path = os.path.join(DATA, "base.dat")
+    meta_path = os.path.join(DATA, "base.meta")
 
     # ── Load index ─────────────────────────────────────────────────────────────
     print(f"Reading {idx_path}")
-    terms, data_offsets, idx_word_min_tiers = read_idx(idx_path)
-    print(f"  {len(terms)} entries, version 3 — OK")
+    keys, data_offsets, idx_word_min_tiers = read_idx(idx_path)
+    print(f"  {len(keys)} entries, version 4 — OK")
 
-    # ── Terms sorted ascending ─────────────────────────────────────────────────
-    assert terms == sorted(terms), "dict.idx: terms are not sorted ascending"
+    # ── Keys sorted ascending ──────────────────────────────────────────────────
+    assert keys == sorted(keys), "base.idx: keys are not sorted ascending"
     print("  sorted — OK")
 
     # ── Load dat ───────────────────────────────────────────────────────────────
@@ -107,27 +113,30 @@ def main():
     errors = []
     override_meanings = []  # meanings with maxTier < FULL (appended by overrides.tsv)
 
-    for i, (term, off, idx_wmt) in enumerate(zip(terms, data_offsets, idx_word_min_tiers)):
+    for i, (key, off, idx_wmt) in enumerate(zip(keys, data_offsets, idx_word_min_tiers)):
         try:
-            meanings = read_entry(dat, off)
+            display, meanings = read_entry(dat, off)
         except Exception as exc:
-            errors.append(f"  '{term}': failed to parse entry at offset {off}: {exc}")
+            errors.append(f"  '{key}': failed to parse entry at offset {off}: {exc}")
             continue
 
+        if not display:
+            errors.append(f"  '{key}': display headword is empty")
+
         if not meanings:
-            errors.append(f"  '{term}': nMeanings == 0")
+            errors.append(f"  '{key}': nMeanings == 0")
             continue
 
         for j, (pc, d, ex, min_t, max_t) in enumerate(meanings):
             if min_t > max_t:
-                errors.append(f"  '{term}' meaning {j}: minTier {min_t} > maxTier {max_t}")
+                errors.append(f"  '{key}' meaning {j}: minTier {min_t} > maxTier {max_t}")
             if max_t < FULL:
-                override_meanings.append((term, j, min_t, max_t))
+                override_meanings.append((key, j, min_t, max_t))
 
         computed_wmt = min(min_t for (_, _, _, min_t, _) in meanings)
         if computed_wmt != idx_wmt:
             errors.append(
-                f"  '{term}': idx wordMinTier={idx_wmt} but min(meaning.minTier)={computed_wmt}"
+                f"  '{key}': idx wordMinTier={idx_wmt} but min(meaning.minTier)={computed_wmt}"
             )
 
     if errors:
@@ -137,32 +146,36 @@ def main():
             print(f"  ... and {len(errors) - 20} more errors", file=sys.stderr)
         sys.exit(f"FAIL: {len(errors)} consistency error(s)")
 
-    print(f"  all {len(terms)} entries consistent — OK")
+    print(f"  all {len(keys)} entries consistent — OK")
 
     # ── Total size <= 14 MB ────────────────────────────────────────────────────
-    total = os.path.getsize(idx_path) + os.path.getsize(dat_path)
+    meta_sz = os.path.getsize(meta_path) if os.path.exists(meta_path) else 0
+    total = os.path.getsize(idx_path) + os.path.getsize(dat_path) + meta_sz
     assert total <= 14 * 1048576, f"Total {total/1048576:.2f} MB exceeds 14 MB LittleFS budget"
     print(f"  total size {total/1048576:.2f} MB — OK")
 
-    # Build a term→(offset, wordMinTier) map for spot-checks.
-    term_map = {t: (off, wmt) for t, off, wmt in zip(terms, data_offsets, idx_word_min_tiers)}
+    # Build a key→(offset, wordMinTier) map for spot-checks.
+    key_map = {k: (off, wmt) for k, off, wmt in zip(keys, data_offsets, idx_word_min_tiers)}
 
     # ── Primary-sense spot-checks: blue / toy / mouse ──────────────────────────
     for w in ("blue", "toy", "mouse"):
-        assert w in term_map, f"'{w}' missing from dict.idx"
-        off, _ = term_map[w]
-        ms = read_entry(dat, off)
+        nk = norm_key(w)
+        assert nk in key_map, f"'{w}' (key='{nk}') missing from base.idx"
+        off, _ = key_map[nk]
+        display, ms = read_entry(dat, off)
         pc, d, ex, min_t, max_t = ms[0]
-        print(f"  {w}: [{POS.get(pc, pc)}] {d[:60]}")
+        print(f"  {display}: [{POS.get(pc, pc)}] {d[:60]}")
 
-    blue_off, _ = term_map["blue"]
-    blue_defs = " ".join(d for _, d, _, _, _ in read_entry(dat, blue_off)).lower()
+    blue_off, _ = key_map[norm_key("blue")]
+    _, blue_meanings = read_entry(dat, blue_off)
+    blue_defs = " ".join(d for _, d, _, _, _ in blue_meanings).lower()
     assert "colour" in blue_defs or "color" in blue_defs, "blue lacks a colour/color sense"
     print("  blue has colour/color sense — OK")
 
     # ── Offensive headword spot-check: "fuck" must have wordMinTier == FULL ────
-    assert "fuck" in term_map, "'fuck' missing from dict.idx (check words_offensive.txt)"
-    _, fuck_wmt = term_map["fuck"]
+    fuck_key = norm_key("fuck")
+    assert fuck_key in key_map, "'fuck' missing from base.idx (check words_offensive.txt)"
+    _, fuck_wmt = key_map[fuck_key]
     assert fuck_wmt == FULL, f"'fuck' wordMinTier={fuck_wmt} but expected FULL ({FULL})"
     print(f"  'fuck' wordMinTier == FULL — OK")
 
@@ -191,7 +204,7 @@ def main():
         f"\n  Full : {tier_counts[FULL]:,}"
     )
     print(
-        f"\nOK: {len(terms)} total entries, {total/1048576:.2f} MB, SENSE_CAP=8"
+        f"\nOK: {len(keys)} total entries, {total/1048576:.2f} MB, SENSE_CAP=8"
     )
     return 0
 
