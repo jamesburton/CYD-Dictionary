@@ -17,6 +17,23 @@
 
 enum DictTier { TIER_SAFE = 0, TIER_MILD = 1, TIER_TEEN = 2, TIER_FULL = 3 };
 
+// How a source contributes when a key is shared with lower-priority sources.
+// MODE_ADDITIVE appends its meanings on top of lower sources; MODE_OVERRIDE
+// contributes its own meanings then stops the merge for that key.
+enum DictMode { MODE_ADDITIVE = 0, MODE_OVERRIDE = 1 };
+
+// UI-facing snapshot of a loaded source, projected from the internal Source.
+// Sources are presented in PRIORITY order (orderIdx 0 = highest priority).
+struct DictSourceInfo
+{
+    String   name;       // display name (from .meta name=)
+    bool     enabled;    // included in the merged view when true
+    int      priority;   // 0 = highest priority
+    DictMode mode;       // additive vs override
+    DictTier floor;      // per-source minimum tier (effective min = max(floor, wmin))
+    bool     onSD;       // true if backed by the SD card, false for flash
+};
+
 struct Meaning
 {
     uint8_t minTier;   // minimum tier at which this meaning is shown (0=Safe)
@@ -64,6 +81,33 @@ int dictLowerBound(const char* key);
 
 // Human-readable part of speech for a posCode ("noun", "verb", ...).
 const char* posName(uint8_t posCode);
+
+// ----------------------------------------------------------------------------
+// Source-settings API. Sources are addressed by their position in PRIORITY
+// order (orderIdx 0 = highest priority); mutating priority via dictMoveSource
+// renumbers the rest. Each mutator persists to NVS and rebuilds the merged view.
+// ----------------------------------------------------------------------------
+
+// Number of loaded sources (0 in embedded fallback mode).
+int  dictSourceCount();
+
+// Fills `out` for the source at priority position `orderIdx`. Returns false if
+// out of range.
+bool dictGetSource(int orderIdx, DictSourceInfo& out);
+
+// Enables/disables the source at `orderIdx` (rebuilds the view, persists).
+void dictSetSourceEnabled(int orderIdx, bool enabled);
+
+// Sets the additive/override mode for the source at `orderIdx`.
+void dictSetSourceMode(int orderIdx, DictMode mode);
+
+// Sets the per-source tier floor for the source at `orderIdx`.
+void dictSetSourceFloor(int orderIdx, DictTier floor);
+
+// Moves the source at `orderIdx` in priority: dir -1 raises priority (towards 0),
+// dir +1 lowers it. Swaps with the neighbour, renumbers, re-sorts, persists,
+// rebuilds the view. No-op at the ends.
+void dictMoveSource(int orderIdx, int dir);
 
 // Normalise a query or headword to a search key: lowercase, strip accents to ASCII,
 // keep a-z 0-9 space '-', drop apostrophes, collapse runs of spaces, trim.
