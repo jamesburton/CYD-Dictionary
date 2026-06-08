@@ -239,15 +239,14 @@ static String promptPin(const char* title)
 // ----------------------------------------------------------------------------
 // On-screen keyboard model
 // ----------------------------------------------------------------------------
-enum KeyType { K_CHAR, K_BACK };
+enum KeyType { K_CHAR, K_BACK, K_SPACE };
 struct Key { int x, y, w, h; char c; KeyType type; };
 static std::vector<Key> g_keys;
 
-// 3-row keyboard (single-word search needs no space/clear keys). Taller keys with
-// padding between rows and a gap above the tab bar for easier targeting.
-static const int KB_TOP = 116;
-static const int KEY_H  = 24;
-static const int ROW_PITCH = 30;
+// 4-row keyboard: rows at 104/131/158/185, each 22px tall, 3px gap above TABBAR_Y=210.
+static const int KB_TOP = 104;
+static const int KEY_H  = 22;
+static const int ROW_PITCH = 27;
 
 static void addRow(const char* letters, int y)
 {
@@ -280,11 +279,23 @@ static void buildKeyboard()
         }
         g_keys.push_back({x + gap, y, bsw, KEY_H, 0, K_BACK});
     }
+
+    // Row 4: space + hyphen + apostrophe
+    {
+        int y = KB_TOP + ROW_PITCH * 3;
+        int spw = 150, sw = 44, gap = 6;
+        int total = spw + gap + sw + gap + sw;
+        int x = (SCREEN_W - total) / 2;
+        g_keys.push_back({x, y, spw, KEY_H, ' ', K_SPACE});
+        g_keys.push_back({x + spw + gap, y, sw, KEY_H, '-', K_CHAR});
+        g_keys.push_back({x + spw + gap + sw + gap, y, sw, KEY_H, '\'', K_CHAR});
+    }
 }
 
 static void drawKey(const Key& k)
 {
-    bool dim = (k.type == K_CHAR) && !g_valid[k.c - 'a'];
+    // Only dim a-z letter keys whose next-letter is invalid; never dim symbols or space.
+    bool dim = (k.type == K_CHAR) && k.c >= 'a' && k.c <= 'z' && !g_valid[k.c - 'a'];
     uint16_t bg = dim ? C_KEYDIM : C_KEY;
     uint16_t tx = dim ? C_KEYDIMTX : C_KEYTX;
     lcd.fillRoundRect(k.x, k.y, k.w, k.h, 4, bg);
@@ -296,6 +307,7 @@ static void drawKey(const Key& k)
     switch (k.type) {
         case K_CHAR:  buf[0] = k.c; label = buf; break;
         case K_BACK:  label = "<-"; break;
+        case K_SPACE: label = "space"; break;
     }
     lcd.drawString(label, k.x + k.w / 2, k.y + k.h / 2);
     lcd.setTextDatum(textdatum_t::top_left);
@@ -543,13 +555,16 @@ static void handleSearch(const Tap& t)
     // Keyboard
     for (auto& k : g_keys) {
         if (inRect(t, k.x, k.y, k.w, k.h)) {
-            if (k.type == K_CHAR && !g_valid[k.c - 'a']) return;   // dead key: ignore
-            if (k.type == K_CHAR) drawKeyPopup(k);                 // tactile feedback
+            // Dead-key guard: only block a-z letters that are invalid next chars.
+            // Symbols (-/') and space are always accepted.
+            if (k.type == K_CHAR && k.c >= 'a' && k.c <= 'z' && !g_valid[k.c - 'a']) return;
+            if (k.type == K_CHAR) drawKeyPopup(k);                 // tactile feedback (safe for symbols)
             switch (k.type) {
                 case K_CHAR:  if (g_query.length() < 24) g_query += k.c; break;
                 case K_BACK:  if (g_query.length()) g_query.remove(g_query.length() - 1); break;
+                case K_SPACE: if (g_query.length() < 24) g_query += ' '; break;
             }
-            if (k.type == K_CHAR) delay(110);                      // let the popup show
+            if (k.type == K_CHAR || k.type == K_SPACE) delay(110); // let the popup show
             buildResults();
             drawSearchField();
             drawSuggestionStrip();
