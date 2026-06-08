@@ -51,7 +51,7 @@ static void initPalette()
 // ----------------------------------------------------------------------------
 // Screen / layout constants
 // ----------------------------------------------------------------------------
-enum Screen { SCR_SEARCH, SCR_BROWSE, SCR_SAVED, SCR_MORE, SCR_DEFINITION, SCR_HISTORY };
+enum Screen { SCR_SEARCH, SCR_BROWSE, SCR_SAVED, SCR_MORE, SCR_DEFINITION, SCR_HISTORY, SCR_DICTS };
 
 static const int TABBAR_Y = 210;
 static const int TABBAR_H = SCREEN_H - TABBAR_Y;   // 30
@@ -743,8 +743,10 @@ static void handleHistory(const Tap& t)
 // MORE
 // ----------------------------------------------------------------------------
 struct MoreBtn { int x, y, w, h; const char* label; };
-static MoreBtn g_moreBtns[4];     // Random, Recent, Recalibrate, Set/Change PIN
+static MoreBtn g_moreBtns[5];     // Random, Recent, Recalibrate, Set/Change PIN, Dictionaries
 static MoreBtn g_tierPills[4];    // Safe / Mild / Teen / Full selector pills
+
+static void drawDicts();          // forward declaration — defined after handleMore
 
 static void drawMore()
 {
@@ -781,27 +783,32 @@ static void drawMore()
         lcd.drawString(tlabels[i], px + pw / 2, py + ph / 2);
     }
 
-    // 2x2 buttons
+    // 2x2 buttons (top 4) + full-width Dictionaries row below
+    // Layout: bh=24, bgap=5 so two rows + one wide row fit above TABBAR_Y=210.
+    // Row 0: y=by..by+24; Row 1: y=by+29..by+53; Row 2: y=by+58..by+82 (ends <=206).
     const char* labels[4] = {"Random word", "Recent words", "Recalibrate", "Set / Change PIN"};
     int by = py + ph + 6;
-    int bw = (SCREEN_W - 16 - 8) / 2, bh = 28, bgap = 6;
+    int bw = (SCREEN_W - 16 - 8) / 2, bh = 24, bgap = 5;
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(textdatum_t::middle_center);
     for (int i = 0; i < 4; ++i) {
         int r = i / 2, c = i % 2;
         int bx = 8 + c * (bw + 8);
         int yy = by + r * (bh + bgap);
         g_moreBtns[i] = {bx, yy, bw, bh, labels[i]};
         lcd.fillRoundRect(bx, yy, bw, bh, 6, C_ACCENT);
-        lcd.setFont(&fonts::Font2);
         lcd.setTextColor(C_HEADERTX, C_ACCENT);
-        lcd.setTextDatum(textdatum_t::middle_center);
         lcd.drawString(labels[i], bx + bw / 2, yy + bh / 2);
     }
-
-    // status
-    lcd.setTextDatum(textdatum_t::top_left);
-    lcd.setFont(&fonts::Font2);
-    lcd.setTextColor(C_SUB, C_BG);
-    lcd.drawString(dictStatus(), 10, by + 2 * bh + bgap + 4);
+    // Dictionaries – full-width row below the 2x2 grid
+    {
+        int fw = SCREEN_W - 16;
+        int yy = by + 2 * (bh + bgap);
+        g_moreBtns[4] = {8, yy, fw, bh, "Dictionaries"};
+        lcd.fillRoundRect(8, yy, fw, bh, 6, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString("Dictionaries", 8 + fw / 2, yy + bh / 2);
+    }
 
     drawTabBar(SCR_MORE);
 }
@@ -853,15 +860,217 @@ static void handleMore(const Tap& t)
         MoreBtn& p = g_tierPills[i];
         if (inRect(t, p.x, p.y, p.w, p.h)) { switchTier((DictTier)i); return; }
     }
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         MoreBtn& b = g_moreBtns[i];
         if (inRect(t, b.x, b.y, b.w, b.h)) {
-            if (i == 0) openDefinition((int)(esp_random() % dictCount()));
+            if      (i == 0) openDefinition((int)(esp_random() % dictCount()));
             else if (i == 1) { g_screen = SCR_HISTORY; g_historyOffset = 0; drawHistory(); }
             else if (i == 2) { recalibrateTouch(); g_wasTouched = false; drawMore(); }
-            else { String np = promptPin("New PIN (Cancel = clear)"); setPin(np); drawMore(); }
+            else if (i == 3) { String np = promptPin("New PIN (Cancel = clear)"); setPin(np); drawMore(); }
+            else             { g_screen = SCR_DICTS; drawDicts(); }
             return;
         }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DICTIONARIES settings screen  (More -> Dictionaries)
+// ----------------------------------------------------------------------------
+// Each row shows: name | On/Off | Up | Dn | Add/Ovr | floor-pill
+// Layout constants for one source row (height >= 28px for tap targets).
+static const int DS_ROW_H   = 32;   // height of one source row
+static const int DS_LIST_TOP = HEADER_H;  // list starts just below the header bar
+
+// Per-row control rects — reused identically by draw and handle so hit tests
+// always match what was painted. Computed fresh for each row.
+struct DictsRowRects {
+    // Row y-origin is passed separately; all rects use screen-absolute coords.
+    int nameX, nameW;
+    int enX,  enW;   // On / Off enable pill
+    int upX,  upW;   // Up chevron
+    int dnX,  dnW;   // Dn chevron
+    int modeX, modeW; // Add / Ovr mode pill
+    int floorX, floorW; // floor pill
+    int h;           // row height
+};
+
+static DictsRowRects dictsRowRects(int /*rowIndex*/)
+{
+    // All widths tuned to total <= SCREEN_W-16 margins.
+    //  name up to ~110px | 36px on/off | 28px up | 28px dn | 36px mode | 44px floor
+    // x origin with 8px left margin.
+    DictsRowRects r;
+    r.h = DS_ROW_H;
+    int x = 8;
+    r.nameX = x;  r.nameW = 102; x += r.nameW + 4;
+    r.enX   = x;  r.enW   = 36;  x += r.enW   + 2;
+    r.upX   = x;  r.upW   = 26;  x += r.upW   + 2;
+    r.dnX   = x;  r.dnW   = 26;  x += r.dnW   + 2;
+    r.modeX = x;  r.modeW = 36;  x += r.modeW + 2;
+    r.floorX= x;  r.floorW= 44;
+    return r;
+}
+
+static void drawDicts()
+{
+    lcd.fillScreen(C_BG);
+
+    // Header bar with Back button
+    lcd.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
+    lcd.fillRoundRect(6, 4, 60, HEADER_H - 8, 6, C_ACCENT);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(textdatum_t::middle_center);
+    lcd.setTextColor(C_HEADERTX, C_ACCENT);
+    lcd.drawString("< Back", 6 + 30, HEADER_H / 2);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextColor(C_HEADERTX, C_HEADER);
+    lcd.drawString("Dictionaries", SCREEN_W / 2, HEADER_H / 2);
+
+    int n = dictSourceCount();
+    if (n == 0) {
+        lcd.setTextDatum(textdatum_t::top_left);
+        lcd.setTextColor(C_SUB, C_BG);
+        lcd.drawString("No dictionaries loaded", 10, DS_LIST_TOP + 10);
+        drawTabBar(SCR_MORE);
+        return;
+    }
+
+    // Column header labels
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(textdatum_t::top_left);
+    lcd.setTextColor(C_SUB, C_BG);
+    DictsRowRects hdr = dictsRowRects(0);
+    int hy = DS_LIST_TOP + 2;
+    lcd.drawString("Name",  hdr.nameX,  hy);
+    lcd.drawString("En",    hdr.enX,    hy);
+    lcd.drawString("Pri",   hdr.upX,    hy);  // "Pri" spans Up/Dn together
+    lcd.drawString("Mode",  hdr.modeX,  hy);
+    lcd.drawString("Floor", hdr.floorX, hy);
+
+    const char* floorLabels[4] = {"Safe", "Mild", "Teen", "Full"};
+
+    int listStart = DS_LIST_TOP + 16;  // below column header labels
+
+    for (int i = 0; i < n; ++i) {
+        DictSourceInfo src;
+        if (!dictGetSource(i, src)) continue;
+
+        DictsRowRects r = dictsRowRects(i);
+        int y = listStart + i * (DS_ROW_H + 2);
+
+        // Row background
+        uint16_t rowBg = src.enabled ? C_ROW : C_KEYDIM;
+        lcd.fillRoundRect(r.nameX - 2, y, SCREEN_W - 12, r.h, 4, rowBg);
+
+        // Name (truncated to nameW)
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextDatum(textdatum_t::middle_left);
+        lcd.setTextColor(src.enabled ? C_TEXT : C_SUB, rowBg);
+        // Truncate the name so it doesn't overflow the nameW column
+        String name = src.name;
+        while (name.length() > 1 && lcd.textWidth(name + "..") > r.nameW) {
+            name.remove(name.length() - 1);
+        }
+        if (name != src.name) name += "..";
+        lcd.drawString(name, r.nameX, y + r.h / 2);
+
+        // Enable pill: On (accent) / Off (dim)
+        uint16_t enBg = src.enabled ? C_ACCENT : C_ROWLINE;
+        uint16_t enTx = src.enabled ? C_HEADERTX : C_SUB;
+        lcd.fillRoundRect(r.enX, y + 3, r.enW, r.h - 6, 4, enBg);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.setTextColor(enTx, enBg);
+        lcd.drawString(src.enabled ? "On" : "Off", r.enX + r.enW / 2, y + r.h / 2);
+
+        // Up chevron (disabled / greyed at top)
+        uint16_t upBg = (i == 0) ? C_ROWLINE : C_ACCENT;
+        uint16_t upTx = (i == 0) ? C_SUB : C_HEADERTX;
+        lcd.fillRoundRect(r.upX, y + 3, r.upW, r.h - 6, 4, upBg);
+        lcd.setTextColor(upTx, upBg);
+        lcd.drawString("Up", r.upX + r.upW / 2, y + r.h / 2);
+
+        // Dn chevron (disabled / greyed at bottom)
+        uint16_t dnBg = (i == n - 1) ? C_ROWLINE : C_ACCENT;
+        uint16_t dnTx = (i == n - 1) ? C_SUB : C_HEADERTX;
+        lcd.fillRoundRect(r.dnX, y + 3, r.dnW, r.h - 6, 4, dnBg);
+        lcd.setTextColor(dnTx, dnBg);
+        lcd.drawString("Dn", r.dnX + r.dnW / 2, y + r.h / 2);
+
+        // Mode pill: Add / Ovr
+        const char* modeLabel = (src.mode == MODE_ADDITIVE) ? "Add" : "Ovr";
+        lcd.fillRoundRect(r.modeX, y + 3, r.modeW, r.h - 6, 4, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString(modeLabel, r.modeX + r.modeW / 2, y + r.h / 2);
+
+        // Floor pill: Safe / Mild / Teen / Full
+        const char* floorLabel = floorLabels[(int)src.floor];
+        lcd.fillRoundRect(r.floorX, y + 3, r.floorW, r.h - 6, 4, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString(floorLabel, r.floorX + r.floorW / 2, y + r.h / 2);
+    }
+
+    // Status line at the bottom (above tab bar)
+    lcd.setTextDatum(textdatum_t::top_left);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextColor(C_SUB, C_BG);
+    lcd.drawString(dictStatus(), 10, TABBAR_Y - 14);
+
+    drawTabBar(SCR_MORE);
+    lcd.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleDicts(const Tap& t)
+{
+    if (handleTabBar(t)) return;
+
+    // Back button: < Back (x=6, y=4, w=60, h=HEADER_H-8)
+    if (inRect(t, 6, 4, 60, HEADER_H - 8)) {
+        g_screen = SCR_MORE;
+        drawMore();
+        return;
+    }
+
+    int n = dictSourceCount();
+    if (n == 0) return;
+
+    int listStart = DS_LIST_TOP + 16;
+
+    for (int i = 0; i < n; ++i) {
+        int y = listStart + i * (DS_ROW_H + 2);
+
+        // Only process rows within the visible tap area (above tab bar)
+        if (y + DS_ROW_H > TABBAR_Y) break;
+
+        // Check if this row was tapped (y-range check)
+        if (t.y < y || t.y >= y + DS_ROW_H) continue;
+
+        DictSourceInfo src;
+        if (!dictGetSource(i, src)) return;
+
+        DictsRowRects r = dictsRowRects(i);
+
+        if (inRect(t, r.enX, y + 3, r.enW, r.h - 6)) {
+            // Enable pill: toggle
+            dictSetSourceEnabled(i, !src.enabled);
+        } else if (inRect(t, r.upX, y + 3, r.upW, r.h - 6)) {
+            // Up: raise priority (move towards index 0)
+            dictMoveSource(i, -1);
+        } else if (inRect(t, r.dnX, y + 3, r.dnW, r.h - 6)) {
+            // Dn: lower priority (move towards end)
+            dictMoveSource(i, +1);
+        } else if (inRect(t, r.modeX, y + 3, r.modeW, r.h - 6)) {
+            // Mode pill: toggle additive <-> override
+            DictMode next = (src.mode == MODE_ADDITIVE) ? MODE_OVERRIDE : MODE_ADDITIVE;
+            dictSetSourceMode(i, next);
+        } else if (inRect(t, r.floorX, y + 3, r.floorW, r.h - 6)) {
+            // Floor pill: cycle Safe -> Mild -> Teen -> Full -> Safe
+            DictTier next = (DictTier)(((int)src.floor + 1) & 3);
+            dictSetSourceFloor(i, next);
+        }
+
+        // Any change: the engine has already persisted + rebuilt the view.
+        drawDicts();
+        return;
     }
 }
 
@@ -1087,6 +1296,7 @@ static void redrawCurrent()
         case SCR_MORE:       drawMore(); break;
         case SCR_DEFINITION: drawDefinition(); break;
         case SCR_HISTORY:    drawHistory(); break;
+        case SCR_DICTS:      drawDicts(); break;
     }
 }
 
@@ -1178,6 +1388,7 @@ void loop()
             case SCR_MORE:       handleMore(t); break;
             case SCR_DEFINITION: break;   // handled above
             case SCR_HISTORY:    handleHistory(t); break;
+            case SCR_DICTS:      handleDicts(t); break;
         }
     }
     delay(10);
