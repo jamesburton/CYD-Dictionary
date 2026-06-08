@@ -64,3 +64,8 @@ int dictLowerBound(const char* key);
 
 // Human-readable part of speech for a posCode ("noun", "verb", ...).
 const char* posName(uint8_t posCode);
+
+// Normalise a query or headword to a search key: lowercase, strip accents to ASCII,
+// keep a-z 0-9 space '-', drop apostrophes, collapse runs of spaces, trim.
+// MUST match the Python implementation in tools/normalize.py.
+void dictNormalizeKey(const char* in, char* out, size_t cap);

@@ -38,6 +38,29 @@ static File          s_dat;                  // shared dict.dat handle
 static DictTier      s_tier     = TIER_FULL;
 static char          s_status[64] = "Built-in set";
 
+// Normalise a query/headword to a search key: lowercase, strip accents to ASCII,
+// keep a-z 0-9 space '-', drop apostrophes, collapse spaces. MUST match
+// tools/normalize.py. ASCII-only accent fold (covers Latin-1 supplement).
+void dictNormalizeKey(const char* in, char* out, size_t cap)
+{
+    size_t o = 0; bool lastSpace = true;
+    for (const unsigned char* p = (const unsigned char*)in; *p && o + 1 < cap; ++p) {
+        unsigned char c = *p;
+        char m = 0;
+        if (c >= 'A' && c <= 'Z') m = c - 'A' + 'a';
+        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) m = c;
+        else if (c == '-') m = '-';
+        else if (c == ' ' || (c >= 9 && c <= 13)) m = ' ';
+        else if (c == '\'' || c == 0x92) continue;       // drop apostrophes
+        else m = ' ';                                     // other punct/UTF-8 -> space
+        if (m == ' ') { if (lastSpace) continue; lastSpace = true; }
+        else lastSpace = false;
+        out[o++] = m;
+    }
+    while (o > 0 && out[o-1] == ' ') --o;                  // trim trailing
+    out[o] = 0;
+}
+
 static const char* tierName(DictTier t)
 {
     switch (t) {
@@ -120,8 +143,8 @@ static bool rebuildTierView()
 static bool loadFullIndex(const char* tag)
 {
     char st[64];
-    File f = s_fs->open("/dict.idx", FILE_READ);
-    if (!f) { snprintf(st, sizeof(st), "%s: dict.idx missing", tag); setStatus(st); return false; }
+    File f = s_fs->open("/dicts/base.idx", FILE_READ);
+    if (!f) { snprintf(st, sizeof(st), "%s: base.idx missing", tag); setStatus(st); return false; }
 
     size_t sz = f.size();
     uint8_t* idx = static_cast<uint8_t*>(heap_caps_malloc(sz, MALLOC_CAP_SPIRAM));
@@ -134,7 +157,7 @@ static bool loadFullIndex(const char* tag)
     uint32_t version = 0, count = 0;
     memcpy(&version, idx + 4, 4);
     memcpy(&count,   idx + 8, 4);
-    if (version != 3) {
+    if (version != 4) {
         snprintf(st, sizeof(st), "%s: idx version %u", tag, (unsigned)version);
         setStatus(st);
         heap_caps_free(idx);
@@ -173,14 +196,14 @@ static bool openSource()
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
     if (SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_DEFAULT, 5) &&
         SD_MMC.cardType() != CARD_NONE) {
-        File d = SD_MMC.open("/dict.dat", FILE_READ);
+        File d = SD_MMC.open("/dicts/base.dat", FILE_READ);
         if (d) { s_dat = d; s_fs = &SD_MMC; return true; }
         SD_MMC.end();
     }
     if (LittleFS.begin(false)) {
-        File d = LittleFS.open("/dict.dat", FILE_READ);
+        File d = LittleFS.open("/dicts/base.dat", FILE_READ);
         if (d) { s_dat = d; s_fs = &LittleFS; return true; }
-        setStatus("Flash: dict.dat missing");
+        setStatus("Flash: base.dat missing");
     } else {
         setStatus("Flash FS mount failed");
     }
@@ -252,9 +275,12 @@ bool dictGet(int i, DictEntry& e)
         return true;
     }
 
-    e.term = s_term[i];
     if (!s_dat) return false;
     s_dat.seek(s_dataOff[i]);
+
+    // v4: read display headword before nMeanings.
+    uint8_t dispLen = 0; s_dat.read(&dispLen, 1);
+    e.term = readField(dispLen);
 
     uint8_t n = 0;
     s_dat.read(&n, 1);
