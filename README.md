@@ -167,16 +167,20 @@ WordNet data is downloaded automatically on the first run of `build_dict.py`
 python tools/build_dict.py
 ```
 
-Outputs into `data/` (PlatformIO's filesystem-image source directory):
+Outputs into `data/dicts/` (PlatformIO's filesystem-image source directory):
 
 | File | Contents |
 |------|----------|
-| `data/dict.idx` | Single index (all words, with per-word minimum tier) |
-| `data/dict.dat` | All word records with per-meaning tier ranges |
+| `data/dicts/base.idx` | Index (all words, normalised search key, per-word minimum tier) |
+| `data/dicts/base.dat` | All word records with display headword and per-meaning tier ranges |
+| `data/dicts/base.meta` | Dictionary metadata (`name`, `mode`, `floor`, `format=4`) |
 
-The `data/` directory is git-ignored. Total size is typically well under 14 MB
-(the LittleFS budget); the script warns if this is exceeded and suggests
-lowering `DICT_SENSE_CAP` (default 8).
+The `data/` directory is git-ignored. Total size is typically around 10 MB,
+well under the 14.4 MB LittleFS budget; the script warns if this is exceeded and
+suggests lowering `DICT_SENSE_CAP` (default 8).
+
+**Purge stale files from `data/dicts/` if you change the file set** before
+flashing — leftover files inflate the LittleFS image and can overflow the partition.
 
 ### 2 — Optional: verify the output
 
@@ -236,56 +240,61 @@ This places the most common sense first: `blue` → colour, `toy` → plaything,
 
 Definitions are capped at 240 characters; examples at 160 characters.
 
-### On-disk format (version 3, little-endian)
+### On-disk format (format v4)
 
-**`dict.idx`** — single index file, all words:
+Dictionaries use **format v4** — each dictionary is three files: `<name>.idx`
+(index with normalised search key and per-word minimum tier), `<name>.dat` (word
+data with display headword and per-meaning tier ranges), and `<name>.meta`
+(plain-text metadata). Full byte-layout details are in
+[`docs/dictionaries.md`](docs/dictionaries.md).
 
+### Source discovery at boot
+
+The engine scans `/dicts/` on LittleFS (flash) first, then SD. Each `*.meta`
+file registers a source; an SD dictionary with the same filename stem as a flash
+dictionary **shadows** (replaces) it. New stems on SD are added alongside flash
+dictionaries. If no sources load, the firmware falls back to an embedded ~90-word
+list baked into `src/WordData.h`.
+
+The active-source count and word count are shown on the **More** screen and
+printed at boot.
+
+---
+
+## Supplementary dictionaries
+
+The dictionary engine supports multiple runtime sources loaded from `/dicts/` on
+LittleFS and/or a FAT32 SD card. Each source is an independently toggleable,
+reorderable dictionary with its own tier floor and merge mode.
+
+**Key capabilities:**
+
+- **Multi-source, priority-ordered** — sources are listed highest to lowest
+  priority in the Dictionaries settings screen. Tap **Up** / **Dn** to reorder.
+- **Additive or override merge** — an *additive* source contributes its meanings
+  alongside lower-priority sources for the same word; an *override* source stops
+  lower sources for any word it contains.
+- **Per-dictionary tier floor** — a dictionary can be hidden entirely below a
+  chosen tier (e.g. a mythology dict set to `floor=safe` is always visible; an
+  explicit-content supplement could be set to `floor=teen`).
+- **Runtime exclusion files** — `.excl` files in `/dicts/exclude/` can hide or
+  gate individual words by key, scoped to all or named dictionaries.
+- **Greek mythology** — a curated set of ~150 entries (Olympians, heroes,
+  monsters, places) is included as a sample supplementary dictionary built from
+  `tools/sources/mythology.json`.
+
+**Build a supplementary dictionary:**
+
+```sh
+python tools/build_supp.py tools/sources/mythology.json mythology --mode additive --floor safe
+pio run -t uploadfs
 ```
-"DIDX"              4-byte magic
-u32 version         must be 3
-u32 count           number of entries
-count × entry:
-    u32 dataOffset  byte offset into dict.dat
-    u8  wordMinTier min(minTier) over all meanings for this word
-    term bytes      lowercase a-z, null-terminated, sorted ascending
-```
 
-The index is loaded entirely into PSRAM (one file, ~0.9 MB). On a tier switch,
-the firmware rebuilds a filtered in-RAM view (retaining only entries where
-`wordMinTier ≤ activeTier`) without re-reading `dict.dat`.
+Or copy the three output files (`mythology.idx`, `mythology.dat`, `mythology.meta`)
+to `/dicts/` on a FAT32 SD card — no reflash needed.
 
-**`dict.dat`** — word data, shared across all tiers:
-
-```
-per entry at dataOffset:
-    u8 nMeanings
-    nMeanings × meaning:
-        u8  tierRange  minTier | (maxTier << 2)  (2 bits each, 0–3)
-        u8  posCode    0=noun 1=verb 2=adjective 3=adverb 4=other
-        u16 defLen
-        def bytes      UTF-8, not null-terminated
-        u16 exLen
-        example bytes  UTF-8, not null-terminated (0 length if no example)
-```
-
-Meanings are stored in frequency order. When serving a lookup, the firmware
-streams meanings from `dict.dat` and includes only those where
-`minTier ≤ activeTier ≤ maxTier`; the file pointer always advances through all
-fields regardless, keeping the read position in sync.
-
-### Source priority at boot
-
-The firmware tries sources in this order:
-
-1. **SD card** — if a FAT32 card is inserted and contains both `dict.dat` and
-   `dict.idx`, it takes priority. Useful for testing alternate word sets without
-   reflashing.
-2. **LittleFS (built-in flash)** — the normal source after `pio run -t uploadfs`.
-3. **Embedded fallback** — a ~90-word child-friendly list baked into
-   `src/WordData.h`, used only when both above are unavailable.
-
-The active source and word count are shown at the bottom of the **More** screen
-(e.g. `Flash: 61842 words (Teen)`) and printed at boot via `esp_rom_printf`.
+See [`docs/dictionaries.md`](docs/dictionaries.md) for the full format
+specification, JSON schema, classification lists, and UI reference.
 
 ---
 
@@ -294,9 +303,9 @@ The active source and word count are shown at the bottom of the **More** screen
 | Path | Contents |
 |------|----------|
 | `src/` | Firmware (main.cpp, Dict.h/cpp, DisplayConfig.hpp, LGFX_Setup.hpp, WordData.h) |
-| `tools/` | Data pipeline and word lists (see below) |
-| `data/` | Generated dictionary files — **git-ignored**, produced by `build_dict.py` |
-| `docs/superpowers/` | Design specs and implementation plans |
+| `tools/` | Data pipeline, word lists, and supplementary sources (see below) |
+| `data/` | Generated dictionary files — **git-ignored**, produced by the build scripts |
+| `docs/` | Documentation; design specs and implementation plans under `docs/superpowers/` |
 | `platformio.ini` | PlatformIO build configuration |
 | `partitions.csv` | Custom partition table (1.5 MB app, ~14.4 MB LittleFS) |
 
@@ -304,8 +313,12 @@ The active source and word count are shown at the bottom of the **More** screen
 
 | File | Role |
 |------|------|
-| `tools/build_dict.py` | Dictionary generator — reads WordNet + word lists, writes `data/` |
+| `tools/build_dict.py` | Base dictionary generator — reads WordNet + word lists, writes `data/dicts/base.*` |
+| `tools/build_supp.py` | Supplementary dictionary builder — converts a JSON source to `data/dicts/<name>.*` |
+| `tools/normalize.py` | Shared search-key normalisation used by both builders and the verifier |
 | `tools/verify_dict.py` | Post-build verifier — checks format, consistency, sizes |
+| `tools/sources/mythology.json` | Curated Greek-mythology source (~150 entries) |
+| `tools/sample-exclusions/extra-rude.excl` | Sample exclusion file (copy to `data/dicts/exclude/`) |
 | `tools/words_offensive.txt` | Strong profanity + slurs → headword floor Full |
 | `tools/words_adult.txt` | Sexual / explicit content → headword floor Teen |
 | `tools/words_mild.txt` | Naughty / slightly rude words → headword floor Mild |
