@@ -223,7 +223,7 @@ is on **UART0** (physical TX/RX pins), not the USB port. Only ROM/ESP-IDF output
 and `esp_rom_printf` calls reach the USB console — including the boot status line:
 
 ```
-[dict] ready: Flash: 63714 words (Full)
+[dict] ready: 2 dicts: 63870 words (Full)
 ```
 
 ---

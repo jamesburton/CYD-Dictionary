@@ -195,7 +195,7 @@ Create a JSON file containing an array of entry objects:
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `term` | string | yes | Display headword, any case/accents/spaces |
-| `pos` | string | yes | `noun`, `verb`, `adjective`, `adverb`, `name`, `other` |
+| `pos` | string | no (default `name`) | `noun`, `verb`, `adjective`, `adverb`, `name`, `other` |
 | `tier` | string | no | `safe` (default), `mild`, `teen`, `full` — the minimum tier for all of this entry's meanings |
 | `defs` | array of strings | yes | One string per definition; at least one required |
 | `example` | string | no | Optional example sentence; attached to the **first** meaning only |
@@ -398,7 +398,7 @@ top → bottom; an `Ovr` source stops lower sources from contributing meanings t
 any key it contains.
 
 All changes persist to NVS immediately and rebuild the merged view. Settings
-survive reboots. Per-source NVS keys are `s_<name>`.
+survive reboots.
 
 ### Exclusions section
 
