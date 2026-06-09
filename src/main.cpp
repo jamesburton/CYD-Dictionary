@@ -911,6 +911,19 @@ static DictsRowRects dictsRowRects(int /*rowIndex*/)
     return r;
 }
 
+// Exclusion subsection geometry. One row per .excl file: name + On/Off pill.
+static const int DS_EXCL_ROW_H = 28;          // tap-target height for an excl row
+static const int DS_EXCL_EN_W  = 36;          // On/Off pill width
+static const int DS_EXCL_HDR_H = 16;          // "Exclusions" label band
+
+// Y origin of the exclusion subsection (the "Exclusions" label), below the source
+// list. `n` is the source count. Shared by draw and handle.
+static int dictsExclSectionTop(int n)
+{
+    int listStart = DS_LIST_TOP + 16;
+    return listStart + n * (DS_ROW_H + 2) + 6;
+}
+
 static void drawDicts()
 {
     lcd.fillScreen(C_BG);
@@ -1009,6 +1022,51 @@ static void drawDicts()
         lcd.drawString(floorLabel, r.floorX + r.floorW / 2, y + r.h / 2);
     }
 
+    // Exclusions subsection (only shown when at least one .excl file is loaded).
+    int xn = dictExclusionCount();
+    if (xn > 0) {
+        int sy = dictsExclSectionTop(n);
+
+        // Section label
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextDatum(textdatum_t::top_left);
+        lcd.setTextColor(C_SUB, C_BG);
+        lcd.drawString("Exclusions", 8, sy);
+
+        int rowTop = sy + DS_EXCL_HDR_H;
+        for (int i = 0; i < xn; ++i) {
+            int y = rowTop + i * (DS_EXCL_ROW_H + 2);
+            if (y + DS_EXCL_ROW_H > TABBAR_Y - 14) break;   // keep clear of status line
+
+            String file; bool en = false;
+            if (!dictGetExclusion(i, file, en)) continue;
+
+            uint16_t rowBg = en ? C_ROW : C_KEYDIM;
+            lcd.fillRoundRect(6, y, SCREEN_W - 12, DS_EXCL_ROW_H, 4, rowBg);
+
+            // File name (truncated to leave room for the pill)
+            int pillX = SCREEN_W - 12 - DS_EXCL_EN_W;
+            int nameMax = pillX - 14;
+            lcd.setFont(&fonts::Font2);
+            lcd.setTextDatum(textdatum_t::middle_left);
+            lcd.setTextColor(en ? C_TEXT : C_SUB, rowBg);
+            String name = file;
+            while (name.length() > 1 && lcd.textWidth(name + "..") > (nameMax - 10)) {
+                name.remove(name.length() - 1);
+            }
+            if (name != file) name += "..";
+            lcd.drawString(name, 12, y + DS_EXCL_ROW_H / 2);
+
+            // On/Off enable pill
+            uint16_t enBg = en ? C_ACCENT : C_ROWLINE;
+            uint16_t enTx = en ? C_HEADERTX : C_SUB;
+            lcd.fillRoundRect(pillX, y + 3, DS_EXCL_EN_W, DS_EXCL_ROW_H - 6, 4, enBg);
+            lcd.setTextDatum(textdatum_t::middle_center);
+            lcd.setTextColor(enTx, enBg);
+            lcd.drawString(en ? "On" : "Off", pillX + DS_EXCL_EN_W / 2, y + DS_EXCL_ROW_H / 2);
+        }
+    }
+
     // Status line at the bottom (above tab bar)
     lcd.setTextDatum(textdatum_t::top_left);
     lcd.setFont(&fonts::Font2);
@@ -1071,6 +1129,26 @@ static void handleDicts(const Tap& t)
         // Any change: the engine has already persisted + rebuilt the view.
         drawDicts();
         return;
+    }
+
+    // Exclusion subsection hit-testing (independent of the source-row loop, so the
+    // source loop's TABBAR break does not swallow exclusion taps).
+    int xn = dictExclusionCount();
+    if (xn > 0) {
+        int rowTop = dictsExclSectionTop(n) + DS_EXCL_HDR_H;
+        int pillX = SCREEN_W - 12 - DS_EXCL_EN_W;
+        for (int i = 0; i < xn; ++i) {
+            int y = rowTop + i * (DS_EXCL_ROW_H + 2);
+            if (y + DS_EXCL_ROW_H > TABBAR_Y - 14) break;
+            if (inRect(t, pillX, y + 3, DS_EXCL_EN_W, DS_EXCL_ROW_H - 6)) {
+                String file; bool en = false;
+                if (dictGetExclusion(i, file, en)) {
+                    dictSetExclusionEnabled(i, !en);
+                    drawDicts();
+                }
+                return;
+            }
+        }
     }
 }
 
