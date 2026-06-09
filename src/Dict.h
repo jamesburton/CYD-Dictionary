@@ -113,3 +113,21 @@ void dictMoveSource(int orderIdx, int dir);
 // keep a-z 0-9 space '-', drop apostrophes, collapse runs of spaces, trim.
 // MUST match the Python implementation in tools/normalize.py.
 void dictNormalizeKey(const char* in, char* out, size_t cap);
+
+// ----------------------------------------------------------------------------
+// Runtime exclusion files (.excl). Each file under /dicts/exclude/ on LittleFS
+// or SD reclassifies a set of keys: HIDE removes them from the merged view, GATE
+// raises their effective min tier (so they only show at the gate tier and above).
+// Files are addressed by load order. Each mutator persists to NVS and rebuilds
+// the merged view.
+// ----------------------------------------------------------------------------
+
+// Number of loaded exclusion files (0 if none / embedded fallback).
+int dictExclusionCount();
+
+// Fills the file name and enabled flag for the exclusion at index `i`. Returns
+// false if out of range.
+bool dictGetExclusion(int i, String& fileOut, bool& enabledOut);
+
+// Enables/disables the exclusion at index `i` (rebuilds the view, persists).
+void dictSetExclusionEnabled(int i, bool enabled);

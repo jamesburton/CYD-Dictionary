@@ -59,6 +59,39 @@ struct Source
 static Source  s_src[MAX_SOURCES];
 static int     s_srcCount = 0;
 
+// ----------------------------------------------------------------------------
+// Runtime exclusions (.excl files under /dicts/exclude).
+//
+// Each file declares an action (HIDE removes matched keys; GATE raises their
+// effective min tier) and a scope (all sources, or a set of source ids/stems).
+// Keys are normalised on load. An exclusion only affects a (key, source) pair
+// when the exclusion is enabled, the source's id is in scope, and the key is in
+// the exclusion's key set.
+// ----------------------------------------------------------------------------
+static const int MAX_EXCLUSIONS = 16;
+static const int MAX_EXCL_SCOPE = 8;
+static const int MAX_EXCL_KEYS  = 256;
+
+enum ExclAction { EXCL_HIDE = 0, EXCL_GATE = 1 };
+
+struct Exclusion
+{
+    char       stem[16];                       // filename stem (e.g. "extra-rude"), <=13 for NVS
+    String     file;                           // display file name (e.g. "extra-rude.excl")
+    bool       enabled;
+    ExclAction action;
+    DictTier   gateTier;                       // gate target tier (EXCL_GATE only)
+    bool       scopeAll;                        // true => applies to every source
+    char       scope[MAX_EXCL_SCOPE][16];      // in-scope source ids (when !scopeAll)
+    int        scopeCount;
+    char**     keys;                           // sorted, normalised key strings (PSRAM)
+    int        keyCount;
+};
+
+static Exclusion s_excl[MAX_EXCLUSIONS];
+static int       s_exclCount = 0;
+static int       s_exclEnabledCount = 0;       // cached: number of enabled exclusions (fast path)
+
 // Merged view (CSR).
 static const char** s_viewKey      = nullptr;   // PSRAM, N
 static uint32_t*    s_contribBase  = nullptr;   // PSRAM, N
@@ -160,6 +193,29 @@ static void freeAllSources()
     freeView();
     for (int i = 0; i < s_srcCount; ++i) freeSource(s_src[i]);
     s_srcCount = 0;
+}
+
+static void freeExclusions()
+{
+    for (int i = 0; i < s_exclCount; ++i) {
+        Exclusion& x = s_excl[i];
+        if (x.keys) {
+            for (int k = 0; k < x.keyCount; ++k) heap_caps_free(x.keys[k]);
+            heap_caps_free(x.keys);
+            x.keys = nullptr;
+        }
+        x.keyCount = 0;
+    }
+    s_exclCount = 0;
+    s_exclEnabledCount = 0;
+}
+
+// Recomputes the cached count of enabled exclusions (fast-path gate).
+static void recountEnabledExclusions()
+{
+    int n = 0;
+    for (int i = 0; i < s_exclCount; ++i) if (s_excl[i].enabled) ++n;
+    s_exclEnabledCount = n;
 }
 
 // ----------------------------------------------------------------------------
@@ -426,12 +482,80 @@ static void sortByPriority()
 // priority order). Two passes: count, then fill.
 // ----------------------------------------------------------------------------
 
-// True if source `si`'s entry `ei` passes the active tier floor.
-static inline bool entryPassesTier(int si, int ei)
+// Marker returned by effectiveMinTier when a (key, source) pair is HIDE-excluded
+// (so it can never pass any tier).
+static const uint8_t TIER_HIDDEN = 0xFF;
+
+// True if exclusion `xi` is in scope for source order index `si`.
+static inline bool exclInScope(int xi, int si)
+{
+    const Exclusion& x = s_excl[xi];
+    if (x.scopeAll) return true;
+    const char* id = s_src[si].id;
+    for (int k = 0; k < x.scopeCount; ++k) {
+        if (strcmp(x.scope[k], id) == 0) return true;
+    }
+    return false;
+}
+
+// Binary-searches an exclusion's sorted key set for `key`. Returns true if found.
+static bool exclHasKey(const Exclusion& x, const char* key)
+{
+    int lo = 0, hi = x.keyCount - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int c = strcmp(x.keys[mid], key);
+        if (c == 0) return true;
+        if (c < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}
+
+// Resolves all enabled, in-scope exclusions matching (`key`, source `si`) into a
+// single classification: HIDE dominates; otherwise the gate tier is the max of
+// matching gates. `outGate` receives the highest gate tier when GATE applies.
+// Returns: 0 = no exclusion, 1 = GATE (outGate set), 2 = HIDE.
+static int exclClassify(int si, const char* key, uint8_t& outGate)
+{
+    if (s_exclEnabledCount == 0) return 0;   // fast path: no enabled exclusions
+    int result = 0;
+    uint8_t gate = 0;
+    for (int xi = 0; xi < s_exclCount; ++xi) {
+        const Exclusion& x = s_excl[xi];
+        if (!x.enabled) continue;
+        if (!exclInScope(xi, si)) continue;
+        if (!exclHasKey(x, key)) continue;
+        if (x.action == EXCL_HIDE) return 2;   // HIDE dominates
+        if ((uint8_t)x.gateTier > gate) gate = (uint8_t)x.gateTier;
+        result = 1;
+    }
+    outGate = gate;
+    return result;
+}
+
+// Effective min tier for source `si`'s entry `ei`: max(wmin, source floor) plus
+// any GATE raise; TIER_HIDDEN if HIDE-excluded. This is the SINGLE source of the
+// per-(key,source) inclusion decision — called identically from both rebuildView
+// passes and from dictGet, so the count/fill passes can never disagree.
+static inline uint8_t effectiveMinTier(int si, int ei)
 {
     uint8_t eff = s_src[si].wmin[ei];
     if ((uint8_t)s_src[si].floor > eff) eff = (uint8_t)s_src[si].floor;
-    return eff <= (uint8_t)s_tier;
+    if (s_exclEnabledCount > 0) {
+        uint8_t gate = 0;
+        int cls = exclClassify(si, s_src[si].key[ei], gate);
+        if (cls == 2) return TIER_HIDDEN;      // HIDE
+        if (cls == 1 && gate > eff) eff = gate; // GATE raises effective min
+    }
+    return eff;
+}
+
+// True if source `si`'s entry `ei` is included at the active tier (passes the tier
+// floor and is not HIDE-excluded).
+static inline bool entryPassesTier(int si, int ei)
+{
+    uint8_t eff = effectiveMinTier(si, ei);
+    return eff != TIER_HIDDEN && eff <= (uint8_t)s_tier;
 }
 
 static bool rebuildView()
@@ -522,6 +646,178 @@ static bool rebuildView()
 }
 
 // ----------------------------------------------------------------------------
+// Exclusion files: discovery, parse, NVS toggle persistence.
+//
+// .excl format: leading `#`-prefixed directive lines `# action: hide` or
+// `# action: gate:<tier>` and `# scope: all` or `# scope: id1,id2`; remaining
+// non-`#` lines are keys (normalised on load). NVS toggle key "x_<stem>".
+// ----------------------------------------------------------------------------
+
+// Persists one exclusion's enabled flag to NVS (namespace "dict", key "x_<stem>").
+static void persistExclusion(const Exclusion& x)
+{
+    Preferences p;
+    if (!p.begin("dict", false)) return;
+    char k[16]; snprintf(k, sizeof(k), "x_%s", x.stem);
+    p.putBool(k, x.enabled);
+    p.end();
+}
+
+// Loads NVS enabled-flag overrides for every exclusion (defaults already in place).
+static void loadExclusionSettings()
+{
+    Preferences p;
+    if (!p.begin("dict", true)) return;
+    for (int i = 0; i < s_exclCount; ++i) {
+        char k[16]; snprintf(k, sizeof(k), "x_%s", s_excl[i].stem);
+        if (p.isKey(k)) s_excl[i].enabled = p.getBool(k, s_excl[i].enabled);
+    }
+    p.end();
+}
+
+// Parses one directive value into an exclusion. `key` is the directive name
+// ("action"/"scope"); `val` its value.
+static void applyExclDirective(Exclusion& x, const String& key, const String& val)
+{
+    if (key == "action") {
+        if (val.startsWith("gate")) {
+            x.action = EXCL_GATE;
+            int colon = val.indexOf(':');
+            x.gateTier = (colon >= 0) ? tierFromName(val.substring(colon + 1).c_str()) : TIER_FULL;
+        } else {
+            x.action = EXCL_HIDE;   // "hide" (default)
+        }
+    } else if (key == "scope") {
+        if (val == "all") {
+            x.scopeAll = true;
+        } else {
+            x.scopeAll = false;
+            x.scopeCount = 0;
+            // Comma-separated source ids.
+            int start = 0;
+            while (start < (int)val.length() && x.scopeCount < MAX_EXCL_SCOPE) {
+                int comma = val.indexOf(',', start);
+                String id = (comma < 0) ? val.substring(start) : val.substring(start, comma);
+                id.trim();
+                if (id.length() > 0 && id.length() < 16) {
+                    strncpy(x.scope[x.scopeCount], id.c_str(), 15);
+                    x.scope[x.scopeCount][15] = 0;
+                    ++x.scopeCount;
+                }
+                if (comma < 0) break;
+                start = comma + 1;
+            }
+        }
+    }
+}
+
+// qsort comparator over char* key strings.
+static int cmpKeyPtr(const void* a, const void* b)
+{
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+// Loads one .excl file into s_excl. Returns true on success.
+static bool loadOneExclusion(fs::FS* fs, const char* path, const char* baseName)
+{
+    if (s_exclCount >= MAX_EXCLUSIONS) return false;
+
+    // Derive the stem (without ".excl") for the NVS key; guard the 15-char limit.
+    char stem[16];
+    size_t bn = strlen(baseName);
+    size_t copy = (bn >= sizeof(stem)) ? sizeof(stem) - 1 : bn;
+    memcpy(stem, baseName, copy); stem[copy] = 0;
+    char* dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+    if (stem[0] == 0 || strlen(stem) > 13) return false;   // "x_<stem>" within 15 chars
+
+    File f = fs->open(path, FILE_READ);
+    if (!f) return false;
+
+    Exclusion& x = s_excl[s_exclCount];
+    strncpy(x.stem, stem, sizeof(x.stem) - 1); x.stem[sizeof(x.stem) - 1] = 0;
+    x.file = baseName;
+    x.enabled = true;
+    x.action = EXCL_HIDE;
+    x.gateTier = TIER_FULL;
+    x.scopeAll = true;
+    x.scopeCount = 0;
+    x.keys = nullptr;
+    x.keyCount = 0;
+
+    // Key-pointer buffer in PSRAM, sized for the per-file cap. Only the first
+    // keyCount slots are ever read (freeExclusions frees all of them + the array).
+    char** keys = static_cast<char**>(heap_caps_malloc(sizeof(char*) * MAX_EXCL_KEYS, MALLOC_CAP_SPIRAM));
+    if (!keys) { f.close(); return false; }
+    int kc = 0;
+
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        if (line.startsWith("#")) {
+            // Directive: "# action: ..." / "# scope: ...".
+            String body = line.substring(1); body.trim();
+            int colon = body.indexOf(':');
+            if (colon < 0) continue;
+            String dk = body.substring(0, colon); dk.trim(); dk.toLowerCase();
+            String dv = body.substring(colon + 1); dv.trim(); dv.toLowerCase();
+            applyExclDirective(x, dk, dv);
+            continue;
+        }
+        // A key line: normalise and store.
+        if (kc >= MAX_EXCL_KEYS) continue;
+        char norm[96];
+        dictNormalizeKey(line.c_str(), norm, sizeof(norm));
+        if (norm[0] == 0) continue;
+        size_t len = strlen(norm);
+        char* kp = static_cast<char*>(heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM));
+        if (!kp) continue;
+        memcpy(kp, norm, len + 1);
+        keys[kc++] = kp;
+    }
+    f.close();
+
+    if (kc == 0) { heap_caps_free(keys); return false; }   // nothing to exclude
+
+    // Sort for binary search (exclHasKey).
+    qsort(keys, kc, sizeof(char*), cmpKeyPtr);
+    x.keys = keys;
+    x.keyCount = kc;
+    ++s_exclCount;
+    return true;
+}
+
+// Scans /dicts/exclude on `fs` for *.excl files and loads each.
+static void scanExclusions(fs::FS* fs)
+{
+    File dir = fs->open("/dicts/exclude");
+    if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+    for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+        if (!entry.isDirectory()) {
+            const char* nm = entry.name();
+            const char* slash = strrchr(nm, '/');
+            const char* base = slash ? slash + 1 : nm;
+            size_t len = strlen(base);
+            if (len > 5 && strcasecmp(base + len - 5, ".excl") == 0) {
+                // Skip a same-named exclusion already loaded (e.g. flash then SD).
+                bool dup = false;
+                for (int i = 0; i < s_exclCount; ++i) {
+                    if (strcasecmp(s_excl[i].file.c_str(), base) == 0) { dup = true; break; }
+                }
+                if (!dup) {
+                    char path[80];
+                    snprintf(path, sizeof(path), "/dicts/exclude/%s", base);
+                    loadOneExclusion(fs, path, base);
+                }
+            }
+        }
+        entry.close();
+    }
+    dir.close();
+}
+
+// ----------------------------------------------------------------------------
 // Lifecycle.
 // ----------------------------------------------------------------------------
 static bool mountSD()
@@ -535,16 +831,24 @@ bool dictBegin(DictTier tier)
 {
     s_tier = tier;
     freeAllSources();
+    freeExclusions();
+
+    bool flashOk = LittleFS.begin(false);
+    bool sdOk    = mountSD();
 
     // Flash first (so flash sources own the canonical id), then SD (shadows).
-    if (LittleFS.begin(false)) {
+    if (flashOk) {
         scanDir(&LittleFS, false);
     } else {
         setStatus("Flash FS mount failed");
     }
-    if (mountSD()) {
+    if (sdOk) {
         scanDir(&SD_MMC, true);
     }
+
+    // Exclusion files (flash first, SD adds any not already present).
+    if (flashOk) scanExclusions(&LittleFS);
+    if (sdOk)    scanExclusions(&SD_MMC);
 
     if (s_srcCount == 0) {
         s_loaded = false;
@@ -556,6 +860,10 @@ bool dictBegin(DictTier tier)
     assignDefaultPriorities();
     loadSourceSettings();
     sortByPriority();
+
+    // Exclusion enabled-flag overrides (defaults: enabled), then cache the count.
+    loadExclusionSettings();
+    recountEnabledExclusions();
 
     if (!rebuildView()) { s_loaded = false; return false; }
 
@@ -618,12 +926,18 @@ bool dictGet(int i, DictEntry& e)
     String display = "";
     uint32_t base = s_contribBase[i];
     uint8_t  cnt  = s_contribCount[i];
+    const char* key = s_viewKey[i];
 
     for (uint8_t c = 0; c < cnt; ++c) {
         int      si  = s_cSrc[base + c];
         uint32_t off = s_cOff[base + c];
         Source&  s   = s_src[si];
         if (!s.dat) continue;
+
+        // Per-(key,source) GATE raise (HIDE contributors were dropped from the
+        // view in rebuildView, so only GATE can apply here).
+        uint8_t gate = 0;
+        if (s_exclEnabledCount > 0) exclClassify(si, key, gate);
 
         s.dat.seek(off);
 
@@ -644,9 +958,10 @@ bool dictGet(int i, DictEntry& e)
             uint8_t minT = tierRange & 3;
             uint8_t maxT = (tierRange >> 2) & 3;
 
-            // Effective min = max(source floor, meaning minTier).
+            // Effective min = max(source floor, meaning minTier, GATE tier).
             uint8_t eff = minT;
             if ((uint8_t)s.floor > eff) eff = (uint8_t)s.floor;
+            if (gate > eff) eff = gate;
             if (eff <= (uint8_t)s_tier && (uint8_t)s_tier <= maxT) {
                 Meaning m;
                 m.minTier = minT; m.maxTier = maxT;
@@ -752,5 +1067,27 @@ void dictMoveSource(int orderIdx, int dir)
     for (int i = 0; i < s_srcCount; ++i) s_src[i].priority = i;
     persistSource(s_src[orderIdx]);
     persistSource(s_src[other]);
+    rebuildView();
+}
+
+// ----------------------------------------------------------------------------
+// Exclusion API.
+// ----------------------------------------------------------------------------
+int dictExclusionCount() { return s_loaded ? s_exclCount : 0; }
+
+bool dictGetExclusion(int i, String& fileOut, bool& enabledOut)
+{
+    if (i < 0 || i >= s_exclCount) return false;
+    fileOut    = s_excl[i].file;
+    enabledOut = s_excl[i].enabled;
+    return true;
+}
+
+void dictSetExclusionEnabled(int i, bool enabled)
+{
+    if (i < 0 || i >= s_exclCount) return;
+    s_excl[i].enabled = enabled;
+    persistExclusion(s_excl[i]);
+    recountEnabledExclusions();
     rebuildView();
 }
