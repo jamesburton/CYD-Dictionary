@@ -88,10 +88,23 @@ def read_entry(dat_bytes, off):
     return display, meanings
 
 
-def main():
-    idx_path = os.path.join(DATA, "base.idx")
-    dat_path = os.path.join(DATA, "base.dat")
-    meta_path = os.path.join(DATA, "base.meta")
+def verify_structure(name):
+    """
+    Verify the structural invariants of a v4 dictionary <name>.{idx,dat,meta}.
+
+    These checks apply to every dictionary (base and supplementary):
+      - magic "DIDX" and version == 4 (enforced by read_idx);
+      - keys sorted ascending;
+      - display headword non-empty;
+      - nMeanings >= 1;
+      - every meaning has minTier <= maxTier;
+      - idx wordMinTier == min(meaning.minTier).
+
+    Returns (keys, dat, key_map, override_meanings) for caller-specific spot-checks,
+    where key_map maps key -> (dataOffset, wordMinTier).
+    """
+    idx_path = os.path.join(DATA, name + ".idx")
+    dat_path = os.path.join(DATA, name + ".dat")
 
     # ── Load index ─────────────────────────────────────────────────────────────
     print(f"Reading {idx_path}")
@@ -99,7 +112,7 @@ def main():
     print(f"  {len(keys)} entries, version 4 — OK")
 
     # ── Keys sorted ascending ──────────────────────────────────────────────────
-    assert keys == sorted(keys), "base.idx: keys are not sorted ascending"
+    assert keys == sorted(keys), f"{name}.idx: keys are not sorted ascending"
     print("  sorted — OK")
 
     # ── Load dat ───────────────────────────────────────────────────────────────
@@ -113,7 +126,7 @@ def main():
     errors = []
     override_meanings = []  # meanings with maxTier < FULL (appended by overrides.tsv)
 
-    for i, (key, off, idx_wmt) in enumerate(zip(keys, data_offsets, idx_word_min_tiers)):
+    for key, off, idx_wmt in zip(keys, data_offsets, idx_word_min_tiers):
         try:
             display, meanings = read_entry(dat, off)
         except Exception as exc:
@@ -144,18 +157,57 @@ def main():
             print(e, file=sys.stderr)
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more errors", file=sys.stderr)
-        sys.exit(f"FAIL: {len(errors)} consistency error(s)")
+        sys.exit(f"FAIL: {len(errors)} consistency error(s) in {name}")
 
     print(f"  all {len(keys)} entries consistent — OK")
 
-    # ── Total size <= 14 MB ────────────────────────────────────────────────────
+    # Build a key→(offset, wordMinTier) map for spot-checks.
+    key_map = {k: (off, wmt) for k, off, wmt in zip(keys, data_offsets, idx_word_min_tiers)}
+    return keys, dat, key_map, override_meanings
+
+
+def verify_mythology():
+    """
+    Verify data/dicts/mythology.* when present (supplementary, format v4).
+
+    Runs the shared structural checks, then mythology-specific spot-checks:
+      - norm_key("zeus") resolves with display "Zeus";
+      - norm_key("mount olympus") resolves with display "Mount Olympus".
+    The base-only asserts (14 MB budget, blue/toy/mouse, fuck==FULL) are NOT
+    applied here — a supplementary dict is small and has its own content.
+    """
+    if not os.path.exists(os.path.join(DATA, "mythology.idx")):
+        return
+
+    print("\n-- Verifying supplementary dict: mythology -----------------------------")
+    keys, dat, key_map, _ = verify_structure("mythology")
+
+    for word, expected_disp in (("zeus", "Zeus"), ("mount olympus", "Mount Olympus")):
+        nk = norm_key(word)
+        assert nk in key_map, f"'{word}' (key='{nk}') missing from mythology.idx"
+        off, _ = key_map[nk]
+        display, _ = read_entry(dat, off)
+        assert display == expected_disp, (
+            f"mythology '{nk}': display={display!r} but expected {expected_disp!r}"
+        )
+        print(f"  '{nk}' -> display {display!r} — OK")
+
+    print(f"  mythology: {len(keys)} entries verified — OK")
+
+
+def main():
+    idx_path = os.path.join(DATA, "base.idx")
+    dat_path = os.path.join(DATA, "base.dat")
+    meta_path = os.path.join(DATA, "base.meta")
+
+    # ── Shared structural checks (magic/version/sorted/consistency) ─────────────
+    keys, dat, key_map, override_meanings = verify_structure("base")
+
+    # ── Total size <= 14 MB (base only) ────────────────────────────────────────
     meta_sz = os.path.getsize(meta_path) if os.path.exists(meta_path) else 0
     total = os.path.getsize(idx_path) + os.path.getsize(dat_path) + meta_sz
     assert total <= 14 * 1048576, f"Total {total/1048576:.2f} MB exceeds 14 MB LittleFS budget"
     print(f"  total size {total/1048576:.2f} MB — OK")
-
-    # Build a key→(offset, wordMinTier) map for spot-checks.
-    key_map = {k: (off, wmt) for k, off, wmt in zip(keys, data_offsets, idx_word_min_tiers)}
 
     # ── Primary-sense spot-checks: blue / toy / mouse ──────────────────────────
     for w in ("blue", "toy", "mouse"):
@@ -195,7 +247,8 @@ def main():
         print("  override spot-check: no override meanings present — skipped")
 
     # ── Simulated per-tier visible word counts ─────────────────────────────────
-    tier_counts = {t: sum(1 for wmt in idx_word_min_tiers if wmt <= t) for t in (SAFE, MILD, TEEN, FULL)}
+    base_wmts = [wmt for (_, wmt) in key_map.values()]
+    tier_counts = {t: sum(1 for wmt in base_wmts if wmt <= t) for t in (SAFE, MILD, TEEN, FULL)}
     print(
         f"\nVisible word counts by active tier:"
         f"\n  Safe : {tier_counts[SAFE]:,}"
@@ -206,6 +259,10 @@ def main():
     print(
         f"\nOK: {len(keys)} total entries, {total/1048576:.2f} MB, SENSE_CAP=8"
     )
+
+    # ── Supplementary dictionaries (verified when present) ──────────────────────
+    verify_mythology()
+
     return 0
 
 
