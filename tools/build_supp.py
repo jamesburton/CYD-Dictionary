@@ -19,6 +19,16 @@ def main():
               for i,d in enumerate(e["defs"]) if d.strip()]
         if ms: rows.append((key, disp, ms))
     rows.sort(key=lambda r: r[0])
+    # Drop adjacent duplicate norm_keys (keep first, warn about dropped).
+    deduped = []; dropped = []
+    for row in rows:
+        if deduped and deduped[-1][0] == row[0]:
+            dropped.append(row[0])
+        else:
+            deduped.append(row)
+    if dropped:
+        print(f"WARNING: dropped {len(dropped)} duplicate key(s): {', '.join(dropped)}")
+    rows = deduped
     out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dicts")
     os.makedirs(out, exist_ok=True)
     offsets = {}
