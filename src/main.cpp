@@ -1300,6 +1300,23 @@ static void drawDefinition()
     DictEntry w;
     dictGet(g_currentWord, w);
     lcd.fillScreen(C_BG);
+
+    // Belt-and-suspenders guard: if no meanings are visible at the current tier
+    // (e.g. the key exists in the view but all meanings are gated/filtered out),
+    // show a clear message rather than a blank/broken body.
+    if (w.meanings.empty()) {
+        freeDefSprite();
+        g_defContentH = 0;
+        g_defScroll = 0;
+        drawDefinitionHeader(w);
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextColor(C_SUB, C_BG);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.drawString("No definition at this level.", SCREEN_W / 2, DEF_BODY_TOP + DEF_VIEW_H / 2);
+        lcd.setTextDatum(textdatum_t::top_left);
+        return;
+    }
+
     g_defContentH = layoutDefinitionBody(w, nullptr);   // measure
 
     // Render the whole body once into a PSRAM sprite for flicker-free scrolling.

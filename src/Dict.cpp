@@ -934,6 +934,9 @@ bool dictGet(int i, DictEntry& e)
         Source&  s   = s_src[si];
         if (!s.dat) continue;
 
+        // Guard against a clearly out-of-range offset (corrupt/truncated .dat).
+        if (off >= s.dat.size()) continue;
+
         // Per-(key,source) GATE raise (HIDE contributors were dropped from the
         // view in rebuildView, so only GATE can apply here).
         uint8_t gate = 0;
@@ -1060,13 +1063,13 @@ void dictMoveSource(int orderIdx, int dir)
     int other = orderIdx + (dir < 0 ? -1 : 1);
     if (other < 0 || other >= s_srcCount) return;   // at an end
 
-    // Swap, then renumber priorities to match array order and persist both.
+    // Swap, then renumber priorities to match array order and persist all
+    // (persisting only the swapped pair leaves other priorities desynced on reboot).
     Source tmp = s_src[orderIdx];
     s_src[orderIdx] = s_src[other];
     s_src[other] = tmp;
     for (int i = 0; i < s_srcCount; ++i) s_src[i].priority = i;
-    persistSource(s_src[orderIdx]);
-    persistSource(s_src[other]);
+    for (int i = 0; i < s_srcCount; ++i) persistSource(s_src[i]);
     rebuildView();
 }
 
