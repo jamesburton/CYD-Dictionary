@@ -1,0 +1,41 @@
+# Additional terms removed from the KIDS dictionary only (sexual, drugs, graphic
+# violence, explicit anatomy, self-harm). One lowercase word per line. '#' = comment.
+# Best-effort; extend as needed.
+sex
+sexual
+sexy
+nude
+naked
+erotic
+porn
+orgasm
+penis
+vagina
+breast
+nipple
+buttock
+genital
+intercourse
+prostitute
+brothel
+condom
+drug
+cocaine
+heroin
+methamphetamine
+marijuana
+cannabis
+opium
+overdose
+syringe
+suicide
+suicidal
+murder
+massacre
+torture
+mutilate
+corpse
+slaughter
+addict
+alcoholic
+intoxicated

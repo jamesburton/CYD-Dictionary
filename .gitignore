@@ -497,3 +497,6 @@ tools/wordset/
 # data/ is the LittleFS image source flashed via `pio run -t uploadfs`.
 data/
 sdcard/
+
+# Generated audit report
+tools/tier_audit.json

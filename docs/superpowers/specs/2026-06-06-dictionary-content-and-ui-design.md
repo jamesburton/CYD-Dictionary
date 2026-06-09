@@ -23,6 +23,91 @@ unsuitable for the user's 8-year-old son.
 Non-goals: perfect word-sense frequency ranking (WordNet's is good-enough and iterable);
 audio; online lookup.
 
+## Revision: four-tier model (supersedes Everyone/Kids)
+
+Filtering is driven by three curated category word lists (single lowercase a-z
+words, one per line, `#` comments) under `tools/`:
+- `words_offensive.txt` — strong profanity + slurs (183)
+- `words_adult.txt` — sexual / explicit (224)
+- `words_mild.txt` — naughty / slightly rude (75)
+
+Four tiers, defined by which categories they exclude (most → least restrictive):
+
+| Tier | enum value      | excludes                          |
+|------|-----------------|-----------------------------------|
+| Safe | `TIER_SAFE = 0` | offensive + adult + mild          |
+| Mild | `TIER_MILD = 1` | offensive + adult                 |
+| Teen | `TIER_TEEN = 2` | offensive                         |
+| Full | `TIER_FULL = 3` | (nothing)                         |
+
+**Storage:** `dict.dat` holds ALL words (the Full set, multi-meaning). Four index
+files share it, each a strict subset (safe ⊆ mild ⊆ teen ⊆ full) pointing into the
+same `dict.dat` offsets: `dict_safe.idx`, `dict_mild.idx`, `dict_teen.idx`,
+`dict_full.idx`.
+
+**Firmware:** `enum DictTier { TIER_SAFE=0, TIER_MILD=1, TIER_TEEN=2, TIER_FULL=3 }`.
+`tierIdxPath()` maps tier→filename; `tierName()`→"Safe"/"Mild"/"Teen"/"Full".
+Default tier `TIER_FULL` (NVS key `tier`, 0–3). The More screen shows a 4-way
+selector. The **PIN lock gates moving to a *more permissive* tier** (higher index)
+than the current one; moving to a more restrictive tier is always allowed. Set /
+clear PIN as before (empty = no lock).
+
+**Generator & verifier** updated accordingly. The old `blocklist_profanity.txt` /
+`blocklist_sensitive.txt` are replaced by the three category lists.
+
+## Revision: per-meaning tier labels (format v3, supersedes 4-index model)
+
+Per-word filtering can't express "show the rooster sense of *cock* but not the
+anatomical one." So filtering moves to the **meaning** level.
+
+**Model**
+- Each meaning carries a tier range `[minTier, maxTier]` (1 byte: 2 bits each).
+  The device shows a meaning only when `minTier <= activeTier <= maxTier`, and
+  **hides a word only when no meaning is visible** at the active tier.
+- **Two independent floors (do NOT conflate — this was the key correction):**
+  - **Hiding floor** → a meaning's `minTier`. Driven ONLY by:
+    (a) the **headword's category** — slur ⇒ Full, explicit ⇒ Teen, mild ⇒ Mild,
+    clean ⇒ Safe; and
+    (b) an explicit **per-sense label** for homograph rude senses (e.g. *cock*=penis
+    labelled Teen) — required because a euphemistic gloss won't self-gate.
+    General definition vocabulary **never** raises `minTier` (else ordinary words
+    like *absorb*/"suck" get hidden from Safe).
+  - **Sanitisation** → driven by a small **core-harmful set** (slurs + explicit
+    anatomy/acts). A *visible* word whose gloss contains a core-harmful word gets a
+    **sanitised override** meaning, with `maxTier = (the core word's allowed tier − 1)`
+    so lower tiers see the clean text while Teen/Full keep the real gloss. This is
+    the only authored residue (e.g. *fart* at Mild without "anus").
+- **Homograph handling:** remove the word from the headword category list AND label
+  its rude sense's `minTier`. Failing to label fails toward exposing a slur — so each
+  removed homograph is a deliberate per-sense act, erring toward gating.
+
+**Storage (format v3)**
+- One `dict.dat`: per meaning `[u8 tierRange][u8 posCode][u16 defLen][def][u16 exLen][ex]`,
+  `nMeanings` prefix as before. `tierRange = minTier | (maxTier<<2)`.
+- One `dict.idx`: per entry `[u32 dataOffset][u8 wordMinTier][term][0x00]`, where
+  `wordMinTier = min(minTier)` over the word's meanings (lets the device build the
+  visible, sorted term list for a tier without reading `dict.dat`). Replaces the four
+  index files.
+- Optional `dict_over.dat` for sanitised override meanings, referenced by a high-bit
+  flag in a meaning slot — OR simply emit override meanings inline in `dict.dat` with
+  their own `[minTier,maxTier]`; inline is simpler and chosen unless size demands a
+  separate file.
+
+**Editable inputs**
+- The three category lists, split by a small **`core_harmful.txt`** subset.
+- `tools/sense_labels.txt` — homograph rude-sense → minTier (agent-authored).
+- `tools/overrides.txt` — sanitised definitions using `>|<|!|=` tier prefixes,
+  compiled to `[minTier,maxTier]` (agent-authored residue).
+
+**Firmware:** load one index; on tier change rebuild the in-RAM term/offset arrays
+filtering by `wordMinTier <= activeTier`. `dictGet` returns only meanings whose range
+includes the active tier; search preview/list rows use the first *visible* meaning.
+
+**Build gate (must run before firmware v3):** revise the lists → re-run the audit
+simulating the split rule and report (1) distinct innocent headwords that def-vocab
+*alone* would over-hide (target ~0), and (2) removed-homograph rude senses with clean
+glosses (exposure risk). Those counts decide viability and the override volume.
+
 ## Data source & pipeline
 
 **Source: WordNet** (via `nltk`), with **`wordfreq`** for word-level frequency.

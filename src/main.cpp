@@ -23,7 +23,7 @@ static Preferences prefs;
 // ----------------------------------------------------------------------------
 static uint16_t C_BG, C_HEADER, C_HEADERTX, C_TEXT, C_SUB, C_KEY, C_KEYTX,
     C_ACCENT, C_TABBAR, C_TABTX, C_TABON, C_ROW, C_ROWLINE, C_WOD, C_WODBORD, C_STAR,
-    C_KEYDIM, C_KEYDIMTX;
+    C_KEYDIM, C_KEYDIMTX, C_DANGER;
 
 static void initPalette()
 {
@@ -45,12 +45,13 @@ static void initPalette()
     C_STAR     = lcd.color565(245, 190, 60);
     C_KEYDIM   = lcd.color565(214, 220, 224);
     C_KEYDIMTX = lcd.color565(176, 184, 190);
+    C_DANGER   = lcd.color565(220, 53, 69);
 }
 
 // ----------------------------------------------------------------------------
 // Screen / layout constants
 // ----------------------------------------------------------------------------
-enum Screen { SCR_SEARCH, SCR_BROWSE, SCR_SAVED, SCR_MORE, SCR_DEFINITION, SCR_HISTORY };
+enum Screen { SCR_SEARCH, SCR_BROWSE, SCR_SAVED, SCR_MORE, SCR_DEFINITION, SCR_HISTORY, SCR_DICTS };
 
 static const int TABBAR_Y = 210;
 static const int TABBAR_H = SCREEN_H - TABBAR_Y;   // 30
@@ -180,16 +181,72 @@ static void pushHistory(const String& term)
     saveHistory();
 }
 
+static String getPin() { return prefs.getString("pin", ""); }
+static void   setPin(const String& p) { prefs.putString("pin", p); }
+
+// Blocking numeric keypad. Returns the entered 4-digit string, or "" if cancelled.
+// `title` is shown at the top.
+static String promptPin(const char* title)
+{
+    String entry = "";
+    // 3x4 grid: 1..9, Cancel, 0, OK
+    const char* labels[12] = {"1","2","3","4","5","6","7","8","9","Cancel","0","OK"};
+    int gw = 80, gh = 38, gap = 6;
+    int gridW = gw * 3 + gap * 2;
+    int x0 = (SCREEN_W - gridW) / 2;
+    int y0 = 56;   // grid bottom = 56 + 4*38 + 3*6 = 226, fits the 240px screen
+
+    auto redraw = [&]() {
+        lcd.fillScreen(C_BG);
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextColor(C_TEXT, C_BG);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.drawString(title, SCREEN_W / 2, 18);
+        // masked entry: entered digits shown as '*', remaining slots as '_'
+        String shown = "";
+        for (size_t i = 0; i < 4; ++i) shown += (i < entry.length() ? '*' : '_');
+        lcd.drawString(shown, SCREEN_W / 2, 40);
+        for (int i = 0; i < 12; ++i) {
+            int r = i / 3, c = i % 3;
+            int bx = x0 + c * (gw + gap), by = y0 + r * (gh + gap);
+            uint16_t col = (i == 9) ? C_SUB : (i == 11 ? C_ACCENT : C_KEY);
+            uint16_t tx = (i == 9 || i == 11) ? C_HEADERTX : C_KEYTX;
+            lcd.fillRoundRect(bx, by, gw, gh, 6, col);
+            lcd.setTextColor(tx, col);
+            lcd.drawString(labels[i], bx + gw / 2, by + gh / 2);
+        }
+        lcd.setTextDatum(textdatum_t::top_left);
+    };
+    redraw();
+
+    g_wasTouched = true;   // ignore the press that opened this modal
+    for (;;) {
+        Tap t = pollTap();
+        if (!t.hit) { delay(10); continue; }
+        for (int i = 0; i < 12; ++i) {
+            int r = i / 3, c = i % 3;
+            int bx = x0 + c * (gw + gap), by = y0 + r * (gh + gap);
+            if (inRect(t, bx, by, gw, gh)) {
+                if (i == 9) return "";                       // Cancel
+                if (i == 11) return entry;                   // OK
+                char d = labels[i][0];
+                if (entry.length() < 4) { entry += d; redraw(); }
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // On-screen keyboard model
 // ----------------------------------------------------------------------------
-enum KeyType { K_CHAR, K_BACK, K_SPACE, K_CLEAR };
+enum KeyType { K_CHAR, K_BACK, K_SPACE };
 struct Key { int x, y, w, h; char c; KeyType type; };
 static std::vector<Key> g_keys;
 
-static const int KB_TOP = 122;
-static const int KEY_H  = 20;
-static const int ROW_PITCH = 22;
+// 4-row keyboard: rows at 104/131/158/185, each 22px tall, 3px gap above TABBAR_Y=210.
+static const int KB_TOP = 104;
+static const int KEY_H  = 22;
+static const int ROW_PITCH = 27;
 
 static void addRow(const char* letters, int y)
 {
@@ -223,20 +280,22 @@ static void buildKeyboard()
         g_keys.push_back({x + gap, y, bsw, KEY_H, 0, K_BACK});
     }
 
-    // Row 4: space + clear
+    // Row 4: space + hyphen + apostrophe
     {
         int y = KB_TOP + ROW_PITCH * 3;
-        int spw = 200, clw = 80, gap = 8;
-        int total = spw + gap + clw;
+        int spw = 150, sw = 44, gap = 6;
+        int total = spw + gap + sw + gap + sw;
         int x = (SCREEN_W - total) / 2;
         g_keys.push_back({x, y, spw, KEY_H, ' ', K_SPACE});
-        g_keys.push_back({x + spw + gap, y, clw, KEY_H, 0, K_CLEAR});
+        g_keys.push_back({x + spw + gap, y, sw, KEY_H, '-', K_CHAR});
+        g_keys.push_back({x + spw + gap + sw + gap, y, sw, KEY_H, '\'', K_CHAR});
     }
 }
 
 static void drawKey(const Key& k)
 {
-    bool dim = (k.type == K_CHAR) && !g_valid[k.c - 'a'];
+    // Only dim a-z letter keys whose next-letter is invalid; never dim symbols or space.
+    bool dim = (k.type == K_CHAR) && k.c >= 'a' && k.c <= 'z' && !g_valid[k.c - 'a'];
     uint16_t bg = dim ? C_KEYDIM : C_KEY;
     uint16_t tx = dim ? C_KEYDIMTX : C_KEYTX;
     lcd.fillRoundRect(k.x, k.y, k.w, k.h, 4, bg);
@@ -249,7 +308,6 @@ static void drawKey(const Key& k)
         case K_CHAR:  buf[0] = k.c; label = buf; break;
         case K_BACK:  label = "<-"; break;
         case K_SPACE: label = "space"; break;
-        case K_CLEAR: label = "clear"; break;
     }
     lcd.drawString(label, k.x + k.w / 2, k.y + k.h / 2);
     lcd.setTextDatum(textdatum_t::top_left);
@@ -373,6 +431,12 @@ static void buildResults()
     }
 }
 
+// Clear (X) button inside the search field, shown only when there's a query.
+static const int SF_X_W = 34;
+static const int SF_X_X = SCREEN_W - 6 - SF_X_W - 2;   // left edge of the X button
+static const int SF_X_Y = 5;
+static const int SF_X_H = HEADER_H - 10;
+
 static void drawSearchField()
 {
     lcd.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
@@ -382,6 +446,11 @@ static void drawSearchField()
     if (g_query.length()) {
         lcd.setTextColor(C_TEXT, C_KEY);
         lcd.drawString(g_query + "_", 14, HEADER_H / 2);
+        // X clear button (red)
+        lcd.fillRoundRect(SF_X_X, SF_X_Y, SF_X_W, SF_X_H, 5, C_DANGER);
+        lcd.setTextColor(C_HEADERTX, C_DANGER);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.drawString("X", SF_X_X + SF_X_W / 2, SF_X_Y + SF_X_H / 2);
     } else {
         lcd.setTextColor(C_SUB, C_KEY);
         lcd.drawString("Type a word...", 14, HEADER_H / 2);
@@ -435,15 +504,17 @@ static void drawPreview()
     }
     DictEntry w;
     dictGet(g_results[0], w);
+    if (w.meanings.empty()) return;
+    const Meaning& m0 = w.meanings[0];
     lcd.setFont(&fonts::Font4);
     int tw = lcd.textWidth(w.term);
     lcd.setTextColor(C_TEXT, C_BG);
     lcd.drawString(w.term, 10, top);
     lcd.setFont(&fonts::Font2);
     lcd.setTextColor(C_ACCENT, C_BG);
-    lcd.drawString(w.pos, 10 + tw + 8, top + 10);
+    lcd.drawString(posName(m0.posCode), 10 + tw + 8, top + 10);
     lcd.setTextColor(C_TEXT, C_BG);
-    drawWrapped(w.def, 10, top + 28, SCREEN_W - 20, 18);
+    drawWrapped(m0.def, 10, top + 28, SCREEN_W - 20, 18);
 }
 
 static void drawSearchScreen()
@@ -462,6 +533,14 @@ static void handleSearch(const Tap& t)
 {
     if (handleTabBar(t)) return;
 
+    // Clear (X) button in the search field
+    if (g_query.length() && inRect(t, SF_X_X, SF_X_Y, SF_X_W, SF_X_H)) {
+        g_query = "";
+        buildResults();
+        drawSearchScreen();
+        return;
+    }
+
     // Suggestion chips
     for (auto& c : g_sugChips) {
         if (inRect(t, c.x, c.y, c.w, c.h)) { openDefinition(c.idx); return; }
@@ -476,15 +555,16 @@ static void handleSearch(const Tap& t)
     // Keyboard
     for (auto& k : g_keys) {
         if (inRect(t, k.x, k.y, k.w, k.h)) {
-            if (k.type == K_CHAR && !g_valid[k.c - 'a']) return;   // dead key: ignore
-            if (k.type == K_CHAR) drawKeyPopup(k);                 // tactile feedback
+            // Dead-key guard: only block a-z letters that are invalid next chars.
+            // Symbols (-/') and space are always accepted.
+            if (k.type == K_CHAR && k.c >= 'a' && k.c <= 'z' && !g_valid[k.c - 'a']) return;
+            if (k.type == K_CHAR) drawKeyPopup(k);                 // tactile feedback (safe for symbols)
             switch (k.type) {
                 case K_CHAR:  if (g_query.length() < 24) g_query += k.c; break;
-                case K_SPACE: if (g_query.length() < 24) g_query += ' '; break;
                 case K_BACK:  if (g_query.length()) g_query.remove(g_query.length() - 1); break;
-                case K_CLEAR: g_query = ""; break;
+                case K_SPACE: if (g_query.length() < 24) g_query += ' '; break;
             }
-            if (k.type == K_CHAR) delay(110);                      // let the popup show
+            if (k.type == K_CHAR || k.type == K_SPACE) delay(110); // let the popup show
             buildResults();
             drawSearchField();
             drawSuggestionStrip();
@@ -533,7 +613,7 @@ static void drawWordList(int total, const IndexAt& at, int offset)
         lcd.setTextColor(C_TEXT, C_ROW);
         lcd.drawString(w.term, 10, y + ROW_H / 2);
         lcd.setTextColor(C_SUB, C_ROW);
-        lcd.drawString(w.pos, listW - 70, y + ROW_H / 2);
+        lcd.drawString(w.meanings.empty() ? "" : posName(w.meanings[0].posCode), listW - 70, y + ROW_H / 2);
     }
 
     // Up / Down buttons on the right
@@ -663,44 +743,72 @@ static void handleHistory(const Tap& t)
 // MORE
 // ----------------------------------------------------------------------------
 struct MoreBtn { int x, y, w, h; const char* label; };
-static MoreBtn g_moreBtns[3];
+static MoreBtn g_moreBtns[5];     // Random, Recent, Recalibrate, Set/Change PIN, Dictionaries
+static MoreBtn g_tierPills[4];    // Safe / Mild / Teen / Full selector pills
+
+static void drawDicts();          // forward declaration — defined after handleMore
 
 static void drawMore()
 {
     lcd.fillScreen(C_BG);
     drawHeader("More");
 
-    // Word of the Day card
-    int cardX = 8, cardY = HEADER_H + 8, cardW = SCREEN_W - 16, cardH = 60;
+    int cardX = 8, cardY = HEADER_H + 4, cardW = SCREEN_W - 16, cardH = 40;
     lcd.fillRoundRect(cardX, cardY, cardW, cardH, 8, C_WOD);
     lcd.drawRoundRect(cardX, cardY, cardW, cardH, 8, C_WODBORD);
     lcd.setFont(&fonts::Font2);
     lcd.setTextDatum(textdatum_t::top_left);
     lcd.setTextColor(C_SUB, C_WOD);
-    lcd.drawString("WORD OF THE DAY", cardX + 10, cardY + 6);
+    lcd.drawString("WORD OF THE DAY", cardX + 8, cardY + 3);
     lcd.setFont(&fonts::Font4);
     lcd.setTextColor(C_TEXT, C_WOD);
-    lcd.drawString(dictTerm(g_wotd), cardX + 10, cardY + 24);
+    lcd.drawString(dictTerm(g_wotd), cardX + 8, cardY + 18);
 
-    // Buttons
-    const char* labels[3] = {"Random word", "Recent words", "Recalibrate touch"};
-    int bx = 8, bw = SCREEN_W - 16, bh = 30, gap = 8;
-    int by = cardY + cardH + 10;
-    for (int i = 0; i < 3; ++i) {
-        g_moreBtns[i] = {bx, by, bw, bh, labels[i]};
-        lcd.fillRoundRect(bx, by, bw, bh, 6, C_ACCENT);
-        lcd.setFont(&fonts::Font2);
-        lcd.setTextColor(C_HEADERTX, C_ACCENT);
-        lcd.setTextDatum(textdatum_t::middle_center);
-        lcd.drawString(labels[i], bx + bw / 2, by + bh / 2);
-        by += bh + gap;
+    // Tier selector
+    int ty = cardY + cardH + 4;
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(textdatum_t::top_left);
+    lcd.setTextColor(C_TEXT, C_BG);
+    lcd.drawString(String("Tier:") + (getPin().length() ? "   (locked)" : ""), 12, ty);
+    int py = ty + 16;
+    const char* tlabels[4] = {"Safe", "Mild", "Teen", "Full"};
+    int gap = 6, pw = (SCREEN_W - 16 - gap * 3) / 4, ph = 26;
+    lcd.setTextDatum(textdatum_t::middle_center);
+    for (int i = 0; i < 4; ++i) {
+        int px = 8 + i * (pw + gap);
+        g_tierPills[i] = {px, py, pw, ph, tlabels[i]};
+        bool on = ((int)dictTier() == i);
+        lcd.fillRoundRect(px, py, pw, ph, 6, on ? C_ACCENT : C_ROWLINE);
+        lcd.setTextColor(on ? C_HEADERTX : C_SUB, on ? C_ACCENT : C_ROWLINE);
+        lcd.drawString(tlabels[i], px + pw / 2, py + ph / 2);
     }
 
-    // Dictionary source / size status.
-    lcd.setTextDatum(textdatum_t::top_left);
+    // 2x2 buttons (top 4) + full-width Dictionaries row below
+    // Layout: bh=24, bgap=5 so two rows + one wide row fit above TABBAR_Y=210.
+    // Row 0: y=by..by+24; Row 1: y=by+29..by+53; Row 2: y=by+58..by+82 (ends <=206).
+    const char* labels[4] = {"Random word", "Recent words", "Recalibrate", "Set / Change PIN"};
+    int by = py + ph + 6;
+    int bw = (SCREEN_W - 16 - 8) / 2, bh = 24, bgap = 5;
     lcd.setFont(&fonts::Font2);
-    lcd.setTextColor(C_SUB, C_BG);
-    lcd.drawString(dictStatus(), 10, by + 2);
+    lcd.setTextDatum(textdatum_t::middle_center);
+    for (int i = 0; i < 4; ++i) {
+        int r = i / 2, c = i % 2;
+        int bx = 8 + c * (bw + 8);
+        int yy = by + r * (bh + bgap);
+        g_moreBtns[i] = {bx, yy, bw, bh, labels[i]};
+        lcd.fillRoundRect(bx, yy, bw, bh, 6, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString(labels[i], bx + bw / 2, yy + bh / 2);
+    }
+    // Dictionaries – full-width row below the 2x2 grid
+    {
+        int fw = SCREEN_W - 16;
+        int yy = by + 2 * (bh + bgap);
+        g_moreBtns[4] = {8, yy, fw, bh, "Dictionaries"};
+        lcd.fillRoundRect(8, yy, fw, bh, 6, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString("Dictionaries", 8 + fw / 2, yy + bh / 2);
+    }
 
     drawTabBar(SCR_MORE);
 }
@@ -723,27 +831,323 @@ static void recalibrateTouch()
     prefs.putBytes("touchcal", calData, sizeof(calData));
 }
 
+static void switchTier(DictTier target)
+{
+    if (target == dictTier()) return;
+    if ((int)target > (int)dictTier()) {       // becoming more permissive
+        String pin = getPin();
+        if (pin.length()) {
+            String got = promptPin("Enter PIN to unlock");
+            if (got != pin) { drawMore(); return; }
+        }
+    }
+    if (dictSetTier(target)) {
+        prefs.putUChar("tier", (uint8_t)target);
+        g_browseOffset = g_savedOffset = g_historyOffset = 0;
+        g_query = ""; buildResults();
+    }
+    drawMore();
+}
+
 static void handleMore(const Tap& t)
 {
     if (handleTabBar(t)) return;
 
-    // WotD card
-    int cardY = HEADER_H + 8;
-    if (t.y >= cardY && t.y < cardY + 60) { openDefinition(g_wotd); return; }
+    int cardY = HEADER_H + 4;
+    if (t.y >= cardY && t.y < cardY + 40) { openDefinition(g_wotd); return; }
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
+        MoreBtn& p = g_tierPills[i];
+        if (inRect(t, p.x, p.y, p.w, p.h)) { switchTier((DictTier)i); return; }
+    }
+    for (int i = 0; i < 5; ++i) {
         MoreBtn& b = g_moreBtns[i];
         if (inRect(t, b.x, b.y, b.w, b.h)) {
-            if (i == 0) {                                   // Random
-                openDefinition((int)(esp_random() % dictCount()));
-            } else if (i == 1) {                            // Recent
-                g_screen = SCR_HISTORY; g_historyOffset = 0; drawHistory();
-            } else {                                        // Recalibrate
-                recalibrateTouch();
-                g_wasTouched = false;
-                drawMore();
-            }
+            if      (i == 0) openDefinition((int)(esp_random() % dictCount()));
+            else if (i == 1) { g_screen = SCR_HISTORY; g_historyOffset = 0; drawHistory(); }
+            else if (i == 2) { recalibrateTouch(); g_wasTouched = false; drawMore(); }
+            else if (i == 3) { String np = promptPin("New PIN (Cancel = clear)"); setPin(np); drawMore(); }
+            else             { g_screen = SCR_DICTS; drawDicts(); }
             return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DICTIONARIES settings screen  (More -> Dictionaries)
+// ----------------------------------------------------------------------------
+// Each row shows: name | On/Off | Up | Dn | Add/Ovr | floor-pill
+// Layout constants for one source row (height >= 28px for tap targets).
+static const int DS_ROW_H   = 32;   // height of one source row
+static const int DS_LIST_TOP = HEADER_H;  // list starts just below the header bar
+
+// Per-row control rects — reused identically by draw and handle so hit tests
+// always match what was painted. Computed fresh for each row.
+struct DictsRowRects {
+    // Row y-origin is passed separately; all rects use screen-absolute coords.
+    int nameX, nameW;
+    int enX,  enW;   // On / Off enable pill
+    int upX,  upW;   // Up chevron
+    int dnX,  dnW;   // Dn chevron
+    int modeX, modeW; // Add / Ovr mode pill
+    int floorX, floorW; // floor pill
+    int h;           // row height
+};
+
+static DictsRowRects dictsRowRects(int /*rowIndex*/)
+{
+    // All widths tuned to total <= SCREEN_W-16 margins.
+    //  name up to ~110px | 36px on/off | 28px up | 28px dn | 36px mode | 44px floor
+    // x origin with 8px left margin.
+    DictsRowRects r;
+    r.h = DS_ROW_H;
+    int x = 8;
+    r.nameX = x;  r.nameW = 102; x += r.nameW + 4;
+    r.enX   = x;  r.enW   = 36;  x += r.enW   + 2;
+    r.upX   = x;  r.upW   = 26;  x += r.upW   + 2;
+    r.dnX   = x;  r.dnW   = 26;  x += r.dnW   + 2;
+    r.modeX = x;  r.modeW = 36;  x += r.modeW + 2;
+    r.floorX= x;  r.floorW= 44;
+    return r;
+}
+
+// Exclusion subsection geometry. One row per .excl file: name + On/Off pill.
+static const int DS_EXCL_ROW_H = 28;          // tap-target height for an excl row
+static const int DS_EXCL_EN_W  = 36;          // On/Off pill width
+static const int DS_EXCL_HDR_H = 16;          // "Exclusions" label band
+
+// Y origin of the exclusion subsection (the "Exclusions" label), below the source
+// list. `n` is the source count. Shared by draw and handle.
+static int dictsExclSectionTop(int n)
+{
+    int listStart = DS_LIST_TOP + 16;
+    return listStart + n * (DS_ROW_H + 2) + 6;
+}
+
+static void drawDicts()
+{
+    lcd.fillScreen(C_BG);
+
+    // Header bar with Back button
+    lcd.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
+    lcd.fillRoundRect(6, 4, 60, HEADER_H - 8, 6, C_ACCENT);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(textdatum_t::middle_center);
+    lcd.setTextColor(C_HEADERTX, C_ACCENT);
+    lcd.drawString("< Back", 6 + 30, HEADER_H / 2);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextColor(C_HEADERTX, C_HEADER);
+    lcd.drawString("Dictionaries", SCREEN_W / 2, HEADER_H / 2);
+
+    int n = dictSourceCount();
+    if (n == 0) {
+        lcd.setTextDatum(textdatum_t::top_left);
+        lcd.setTextColor(C_SUB, C_BG);
+        lcd.drawString("No dictionaries loaded", 10, DS_LIST_TOP + 10);
+        drawTabBar(SCR_MORE);
+        return;
+    }
+
+    // Column header labels
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(textdatum_t::top_left);
+    lcd.setTextColor(C_SUB, C_BG);
+    DictsRowRects hdr = dictsRowRects(0);
+    int hy = DS_LIST_TOP + 2;
+    lcd.drawString("Name",  hdr.nameX,  hy);
+    lcd.drawString("En",    hdr.enX,    hy);
+    lcd.drawString("Pri",   hdr.upX,    hy);  // "Pri" spans Up/Dn together
+    lcd.drawString("Mode",  hdr.modeX,  hy);
+    lcd.drawString("Floor", hdr.floorX, hy);
+
+    const char* floorLabels[4] = {"Safe", "Mild", "Teen", "Full"};
+
+    int listStart = DS_LIST_TOP + 16;  // below column header labels
+
+    for (int i = 0; i < n; ++i) {
+        DictSourceInfo src;
+        if (!dictGetSource(i, src)) continue;
+
+        DictsRowRects r = dictsRowRects(i);
+        int y = listStart + i * (DS_ROW_H + 2);
+
+        // Row background
+        uint16_t rowBg = src.enabled ? C_ROW : C_KEYDIM;
+        lcd.fillRoundRect(r.nameX - 2, y, SCREEN_W - 12, r.h, 4, rowBg);
+
+        // Name (truncated to nameW)
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextDatum(textdatum_t::middle_left);
+        lcd.setTextColor(src.enabled ? C_TEXT : C_SUB, rowBg);
+        // Truncate the name so it doesn't overflow the nameW column
+        String name = src.name;
+        while (name.length() > 1 && lcd.textWidth(name + "..") > r.nameW) {
+            name.remove(name.length() - 1);
+        }
+        if (name != src.name) name += "..";
+        lcd.drawString(name, r.nameX, y + r.h / 2);
+
+        // Enable pill: On (accent) / Off (dim)
+        uint16_t enBg = src.enabled ? C_ACCENT : C_ROWLINE;
+        uint16_t enTx = src.enabled ? C_HEADERTX : C_SUB;
+        lcd.fillRoundRect(r.enX, y + 3, r.enW, r.h - 6, 4, enBg);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.setTextColor(enTx, enBg);
+        lcd.drawString(src.enabled ? "On" : "Off", r.enX + r.enW / 2, y + r.h / 2);
+
+        // Up chevron (disabled / greyed at top)
+        uint16_t upBg = (i == 0) ? C_ROWLINE : C_ACCENT;
+        uint16_t upTx = (i == 0) ? C_SUB : C_HEADERTX;
+        lcd.fillRoundRect(r.upX, y + 3, r.upW, r.h - 6, 4, upBg);
+        lcd.setTextColor(upTx, upBg);
+        lcd.drawString("Up", r.upX + r.upW / 2, y + r.h / 2);
+
+        // Dn chevron (disabled / greyed at bottom)
+        uint16_t dnBg = (i == n - 1) ? C_ROWLINE : C_ACCENT;
+        uint16_t dnTx = (i == n - 1) ? C_SUB : C_HEADERTX;
+        lcd.fillRoundRect(r.dnX, y + 3, r.dnW, r.h - 6, 4, dnBg);
+        lcd.setTextColor(dnTx, dnBg);
+        lcd.drawString("Dn", r.dnX + r.dnW / 2, y + r.h / 2);
+
+        // Mode pill: Add / Ovr
+        const char* modeLabel = (src.mode == MODE_ADDITIVE) ? "Add" : "Ovr";
+        lcd.fillRoundRect(r.modeX, y + 3, r.modeW, r.h - 6, 4, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString(modeLabel, r.modeX + r.modeW / 2, y + r.h / 2);
+
+        // Floor pill: Safe / Mild / Teen / Full
+        const char* floorLabel = floorLabels[(int)src.floor];
+        lcd.fillRoundRect(r.floorX, y + 3, r.floorW, r.h - 6, 4, C_ACCENT);
+        lcd.setTextColor(C_HEADERTX, C_ACCENT);
+        lcd.drawString(floorLabel, r.floorX + r.floorW / 2, y + r.h / 2);
+    }
+
+    // Exclusions subsection (only shown when at least one .excl file is loaded).
+    int xn = dictExclusionCount();
+    if (xn > 0) {
+        int sy = dictsExclSectionTop(n);
+
+        // Section label
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextDatum(textdatum_t::top_left);
+        lcd.setTextColor(C_SUB, C_BG);
+        lcd.drawString("Exclusions", 8, sy);
+
+        int rowTop = sy + DS_EXCL_HDR_H;
+        for (int i = 0; i < xn; ++i) {
+            int y = rowTop + i * (DS_EXCL_ROW_H + 2);
+            if (y + DS_EXCL_ROW_H > TABBAR_Y - 14) break;   // keep clear of status line
+
+            String file; bool en = false;
+            if (!dictGetExclusion(i, file, en)) continue;
+
+            uint16_t rowBg = en ? C_ROW : C_KEYDIM;
+            lcd.fillRoundRect(6, y, SCREEN_W - 12, DS_EXCL_ROW_H, 4, rowBg);
+
+            // File name (truncated to leave room for the pill)
+            int pillX = SCREEN_W - 12 - DS_EXCL_EN_W;
+            int nameMax = pillX - 14;
+            lcd.setFont(&fonts::Font2);
+            lcd.setTextDatum(textdatum_t::middle_left);
+            lcd.setTextColor(en ? C_TEXT : C_SUB, rowBg);
+            String name = file;
+            while (name.length() > 1 && lcd.textWidth(name + "..") > (nameMax - 10)) {
+                name.remove(name.length() - 1);
+            }
+            if (name != file) name += "..";
+            lcd.drawString(name, 12, y + DS_EXCL_ROW_H / 2);
+
+            // On/Off enable pill
+            uint16_t enBg = en ? C_ACCENT : C_ROWLINE;
+            uint16_t enTx = en ? C_HEADERTX : C_SUB;
+            lcd.fillRoundRect(pillX, y + 3, DS_EXCL_EN_W, DS_EXCL_ROW_H - 6, 4, enBg);
+            lcd.setTextDatum(textdatum_t::middle_center);
+            lcd.setTextColor(enTx, enBg);
+            lcd.drawString(en ? "On" : "Off", pillX + DS_EXCL_EN_W / 2, y + DS_EXCL_ROW_H / 2);
+        }
+    }
+
+    // Status line at the bottom (above tab bar)
+    lcd.setTextDatum(textdatum_t::top_left);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextColor(C_SUB, C_BG);
+    lcd.drawString(dictStatus(), 10, TABBAR_Y - 14);
+
+    drawTabBar(SCR_MORE);
+    lcd.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleDicts(const Tap& t)
+{
+    if (handleTabBar(t)) return;
+
+    // Back button: < Back (x=6, y=4, w=60, h=HEADER_H-8)
+    if (inRect(t, 6, 4, 60, HEADER_H - 8)) {
+        g_screen = SCR_MORE;
+        drawMore();
+        return;
+    }
+
+    int n = dictSourceCount();
+    if (n == 0) return;
+
+    int listStart = DS_LIST_TOP + 16;
+
+    for (int i = 0; i < n; ++i) {
+        int y = listStart + i * (DS_ROW_H + 2);
+
+        // Only process rows within the visible tap area (above tab bar)
+        if (y + DS_ROW_H > TABBAR_Y) break;
+
+        // Check if this row was tapped (y-range check)
+        if (t.y < y || t.y >= y + DS_ROW_H) continue;
+
+        DictSourceInfo src;
+        if (!dictGetSource(i, src)) return;
+
+        DictsRowRects r = dictsRowRects(i);
+
+        if (inRect(t, r.enX, y + 3, r.enW, r.h - 6)) {
+            // Enable pill: toggle
+            dictSetSourceEnabled(i, !src.enabled);
+        } else if (inRect(t, r.upX, y + 3, r.upW, r.h - 6)) {
+            // Up: raise priority (move towards index 0)
+            dictMoveSource(i, -1);
+        } else if (inRect(t, r.dnX, y + 3, r.dnW, r.h - 6)) {
+            // Dn: lower priority (move towards end)
+            dictMoveSource(i, +1);
+        } else if (inRect(t, r.modeX, y + 3, r.modeW, r.h - 6)) {
+            // Mode pill: toggle additive <-> override
+            DictMode next = (src.mode == MODE_ADDITIVE) ? MODE_OVERRIDE : MODE_ADDITIVE;
+            dictSetSourceMode(i, next);
+        } else if (inRect(t, r.floorX, y + 3, r.floorW, r.h - 6)) {
+            // Floor pill: cycle Safe -> Mild -> Teen -> Full -> Safe
+            DictTier next = (DictTier)(((int)src.floor + 1) & 3);
+            dictSetSourceFloor(i, next);
+        }
+
+        // Any change: the engine has already persisted + rebuilt the view.
+        drawDicts();
+        return;
+    }
+
+    // Exclusion subsection hit-testing (independent of the source-row loop, so the
+    // source loop's TABBAR break does not swallow exclusion taps).
+    int xn = dictExclusionCount();
+    if (xn > 0) {
+        int rowTop = dictsExclSectionTop(n) + DS_EXCL_HDR_H;
+        int pillX = SCREEN_W - 12 - DS_EXCL_EN_W;
+        for (int i = 0; i < xn; ++i) {
+            int y = rowTop + i * (DS_EXCL_ROW_H + 2);
+            if (y + DS_EXCL_ROW_H > TABBAR_Y - 14) break;
+            if (inRect(t, pillX, y + 3, DS_EXCL_EN_W, DS_EXCL_ROW_H - 6)) {
+                String file; bool en = false;
+                if (dictGetExclusion(i, file, en)) {
+                    dictSetExclusionEnabled(i, !en);
+                    drawDicts();
+                }
+                return;
+            }
         }
     }
 }
@@ -753,14 +1157,26 @@ static void handleMore(const Tap& t)
 // ----------------------------------------------------------------------------
 static const int DEF_BACK_W = 70;
 static const int DEF_STAR_W = 50;
+static const int DEF_BODY_TOP = HEADER_H;                 // body starts under the fixed header
+static const int DEF_VIEW_H   = SCREEN_H - DEF_BODY_TOP;  // viewport height (212)
+static const int DEF_SB_W     = 5;                        // scrollbar width
+static int g_defScroll = 0;                               // current scroll offset (px)
+static int g_defContentH = 0;                             // total content height (px), set by layout
 
-static void drawDefinition()
+// Off-screen content sprite (PSRAM) so scrolling is a single fast blit, not a
+// per-frame re-render. Rebuilt once when a definition opens; freed on leaving.
+static lgfx::LGFX_Sprite g_defSprite(&lcd);
+static bool g_defSpriteOk = false;
+static void freeDefSprite() { if (g_defSpriteOk) { g_defSprite.deleteSprite(); g_defSpriteOk = false; } }
+
+// Drag-to-scroll state (declarations here so handleDefinition can reference them)
+static bool s_defDown = false;
+static int  s_defY0 = 0, s_defScroll0 = 0, s_defDownX = 0, s_defDownY = 0;
+static bool s_defDragged = false;
+
+// Draws the fixed top bar (Back + headword + favourite toggle).
+static void drawDefinitionHeader(const DictEntry& w)
 {
-    DictEntry w;
-    dictGet(g_currentWord, w);
-    lcd.fillScreen(C_BG);
-
-    // Top bar: Back + Star
     lcd.fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
     lcd.fillRoundRect(6, 4, DEF_BACK_W, HEADER_H - 8, 6, C_ACCENT);
     lcd.setFont(&fonts::Font2);
@@ -769,32 +1185,156 @@ static void drawDefinition()
     lcd.drawString("< Back", 6 + DEF_BACK_W / 2, HEADER_H / 2);
 
     bool fav = isFav(w.term);
-    lcd.fillRoundRect(SCREEN_W - DEF_STAR_W - 6, 4, DEF_STAR_W, HEADER_H - 8, 6,
-                      fav ? C_STAR : C_ACCENT);
+    lcd.fillRoundRect(SCREEN_W - DEF_STAR_W - 6, 4, DEF_STAR_W, HEADER_H - 8, 6, fav ? C_STAR : C_ACCENT);
     lcd.setTextColor(C_HEADERTX);
     lcd.drawString(fav ? "* in" : "+ fav", SCREEN_W - DEF_STAR_W / 2 - 6, HEADER_H / 2);
-    lcd.setTextDatum(textdatum_t::top_left);
 
-    // Headword + part of speech
-    int y = HEADER_H + 8;
+    // headword centred between the two buttons
     lcd.setFont(&fonts::Font4);
-    lcd.setTextColor(C_TEXT, C_BG);
-    lcd.drawString(w.term, 10, y);
-    y += 30;
-    lcd.setFont(&fonts::Font2);
-    lcd.setTextColor(C_ACCENT, C_BG);
-    lcd.drawString(w.pos, 10, y);
-    y += 22;
+    lcd.setTextColor(C_HEADERTX, C_HEADER);
+    lcd.drawString(w.term, SCREEN_W / 2, HEADER_H / 2);
+    lcd.setTextDatum(textdatum_t::top_left);
+}
 
-    // Definition
-    lcd.setTextColor(C_TEXT, C_BG);
-    y = drawWrapped(w.def, 10, y, SCREEN_W - 20, 20) + 6;
+// Lays out the grouped meanings at content coords (origin 0,0). If g != nullptr,
+// draws into it; otherwise measures only. Returns total content height. Grouped by
+// POS in first-seen order. Drawing into a tall sprite lets scrolling be one blit.
+static int layoutDefinitionBody(const DictEntry& w, lgfx::LovyanGFX* g)
+{
+    lgfx::LovyanGFX* M = g ? g : static_cast<lgfx::LovyanGFX*>(&lcd);   // width metrics / draw target
+    const int x = 10;
+    const int maxw = SCREEN_W - DEF_SB_W - x - 6;
+    const int lineH = 20;
+    int vy = 0;   // content-space y
 
-    // Example
-    if (w.example.length()) {
-        lcd.setTextColor(C_SUB, C_BG);
-        drawWrapped(String("\"") + w.example + "\"", 10, y, SCREEN_W - 20, 20);
+    // unique POS codes in first-seen order
+    uint8_t order[8]; int nOrder = 0;
+    for (const auto& m : w.meanings) {
+        bool seen = false;
+        for (int k = 0; k < nOrder; ++k) if (order[k] == m.posCode) { seen = true; break; }
+        if (!seen && nOrder < 8) order[nOrder++] = m.posCode;
     }
+
+    auto drawLineWrapped = [&](const String& text, uint16_t color, int indent) {
+        M->setFont(&fonts::Font2);
+        String line = "";
+        int start = 0;
+        int avail = maxw - indent;
+        while (start <= (int)text.length()) {
+            int sp = text.indexOf(' ', start);
+            String word = (sp < 0) ? text.substring(start) : text.substring(start, sp);
+            String trial = line.length() ? line + " " + word : word;
+            if (M->textWidth(trial) > avail && line.length()) {
+                if (g) { g->setTextColor(color, C_BG); g->drawString(line, x + indent, vy); }
+                vy += lineH;
+                line = word;
+            } else {
+                line = trial;
+            }
+            if (sp < 0) break;
+            start = sp + 1;
+        }
+        if (line.length()) {
+            if (g) { g->setTextColor(color, C_BG); g->drawString(line, x + indent, vy); }
+            vy += lineH;
+        }
+    };
+
+    vy += 6;
+    for (int gi = 0; gi < nOrder; ++gi) {
+        uint8_t pc = order[gi];
+        if (g) {
+            g->setFont(&fonts::Font2);
+            g->setTextColor(C_ACCENT, C_BG);
+            String h = String(posName(pc)); h.toUpperCase();
+            g->drawString(h, x, vy);
+        }
+        vy += 22;
+        int n = 1;
+        for (const auto& m : w.meanings) {
+            if (m.posCode != pc) continue;
+            drawLineWrapped(String(n) + ".  " + m.def, C_TEXT, 0);
+            if (m.example.length()) drawLineWrapped(String("\"") + m.example + "\"", C_SUB, 14);
+            vy += 4;
+            ++n;
+        }
+        vy += 6;
+    }
+    return vy;
+}
+
+static int defMaxScroll()
+{
+    int m = g_defContentH - DEF_VIEW_H;
+    return m > 0 ? m : 0;
+}
+
+// Redraws just the scrolling body + scrollbar (header stays put). The body is one
+// blit of the pre-rendered content sprite, clipped to the viewport.
+static void drawDefinitionBody()
+{
+    int trackX = SCREEN_W - DEF_SB_W;
+    if (g_defSpriteOk) {
+        lcd.setClipRect(0, DEF_BODY_TOP, SCREEN_W - DEF_SB_W, DEF_VIEW_H);
+        g_defSprite.pushSprite(0, DEF_BODY_TOP - g_defScroll);
+        lcd.clearClipRect();
+    } else {
+        lcd.fillRect(0, DEF_BODY_TOP, SCREEN_W - DEF_SB_W, DEF_VIEW_H, C_BG);
+    }
+
+    // scrollbar
+    int maxs = defMaxScroll();
+    if (maxs > 0) {
+        lcd.fillRect(trackX, DEF_BODY_TOP, DEF_SB_W, DEF_VIEW_H, C_ROWLINE);
+        int thumbH = DEF_VIEW_H * DEF_VIEW_H / g_defContentH;
+        if (thumbH < 18) thumbH = 18;
+        int thumbY = DEF_BODY_TOP + (DEF_VIEW_H - thumbH) * g_defScroll / maxs;
+        lcd.fillRoundRect(trackX, thumbY, DEF_SB_W, thumbH, 2, C_ACCENT);
+    } else {
+        lcd.fillRect(trackX, DEF_BODY_TOP, DEF_SB_W, DEF_VIEW_H, C_BG);
+    }
+}
+
+static void drawDefinition()
+{
+    DictEntry w;
+    dictGet(g_currentWord, w);
+    lcd.fillScreen(C_BG);
+
+    // Belt-and-suspenders guard: if no meanings are visible at the current tier
+    // (e.g. the key exists in the view but all meanings are gated/filtered out),
+    // show a clear message rather than a blank/broken body.
+    if (w.meanings.empty()) {
+        freeDefSprite();
+        g_defContentH = 0;
+        g_defScroll = 0;
+        drawDefinitionHeader(w);
+        lcd.setFont(&fonts::Font2);
+        lcd.setTextColor(C_SUB, C_BG);
+        lcd.setTextDatum(textdatum_t::middle_center);
+        lcd.drawString("No definition at this level.", SCREEN_W / 2, DEF_BODY_TOP + DEF_VIEW_H / 2);
+        lcd.setTextDatum(textdatum_t::top_left);
+        return;
+    }
+
+    g_defContentH = layoutDefinitionBody(w, nullptr);   // measure
+
+    // Render the whole body once into a PSRAM sprite for flicker-free scrolling.
+    freeDefSprite();
+    int sw = SCREEN_W - DEF_SB_W;
+    int sh = g_defContentH < DEF_VIEW_H ? DEF_VIEW_H : g_defContentH;
+    if (sh > 4000) sh = 4000;   // safety cap
+    g_defSprite.setColorDepth(16);
+    g_defSprite.setPsram(true);
+    g_defSpriteOk = (g_defSprite.createSprite(sw, sh) != nullptr);
+    if (g_defSpriteOk) {
+        g_defSprite.fillScreen(C_BG);
+        g_defSprite.setTextDatum(textdatum_t::top_left);
+        layoutDefinitionBody(w, &g_defSprite);
+    }
+
+    drawDefinitionHeader(w);
+    drawDefinitionBody();
 }
 
 static void openDefinition(int idx)
@@ -802,6 +1342,7 @@ static void openDefinition(int idx)
     if (idx < 0 || idx >= dictCount()) return;
     if (g_screen != SCR_DEFINITION && g_screen != SCR_HISTORY) g_prevScreen = g_screen;
     g_currentWord = idx;
+    g_defScroll = 0;
     g_screen = SCR_DEFINITION;
     pushHistory(dictTerm(idx));
     drawDefinition();
@@ -813,7 +1354,9 @@ static void handleDefinition(const Tap& t)
 {
     // Back
     if (inRect(t, 6, 4, DEF_BACK_W, HEADER_H - 8)) {
+        freeDefSprite();                          // reclaim PSRAM
         g_screen = g_prevScreen;
+        s_defDown = false; g_wasTouched = true;   // swallow this release on the next screen
         redrawCurrent();
         return;
     }
@@ -848,6 +1391,7 @@ static void redrawCurrent()
         case SCR_MORE:       drawMore(); break;
         case SCR_DEFINITION: drawDefinition(); break;
         case SCR_HISTORY:    drawHistory(); break;
+        case SCR_DICTS:      drawDicts(); break;
     }
 }
 
@@ -872,10 +1416,12 @@ void setup()
     initPalette();
     buildKeyboard();
 
-    // Load the dictionary source (SD corpus if present, else embedded set).
-    dictBegin();
-
     prefs.begin("dict", false);
+
+    // Load the dictionary for the saved tier (SD corpus if present, else flash, else embedded).
+    DictTier startTier = (DictTier)prefs.getUChar("tier", TIER_FULL);
+    dictBegin(startTier);
+
     loadState();
 
     // Touch calibration: apply stored transform, or run a one-time calibration.
@@ -894,8 +1440,40 @@ void setup()
     esp_rom_printf("[dict] ready: %s\n", dictStatus());
 }
 
+// Continuous touch handler for the definition screen: drag to scroll, tap (no
+// movement) falls through to handleDefinition() for Back / favourite.
+static void handleDefinitionTouch()
+{
+    int32_t x, y;
+    bool now = lcd.getTouch(&x, &y);
+    if (now && !s_defDown) {
+        s_defDown = true; s_defDragged = false;
+        s_defY0 = y; s_defScroll0 = g_defScroll; s_defDownX = x; s_defDownY = y;
+    } else if (now && s_defDown) {
+        int dy = s_defY0 - y;
+        if (abs(dy) > 6) s_defDragged = true;
+        if (s_defDragged) {
+            int ns = s_defScroll0 + dy;
+            if (ns < 0) ns = 0;
+            if (ns > defMaxScroll()) ns = defMaxScroll();
+            if (ns != g_defScroll) { g_defScroll = ns; drawDefinitionBody(); }
+        }
+    } else if (!now && s_defDown) {
+        s_defDown = false;
+        if (!s_defDragged) {
+            Tap t{true, s_defDownX, s_defDownY};
+            handleDefinition(t);   // Back / favourite hit-testing on the fixed header
+        }
+    }
+}
+
 void loop()
 {
+    if (g_screen == SCR_DEFINITION) {
+        handleDefinitionTouch();
+        delay(10);
+        return;
+    }
     Tap t = pollTap();
     if (t.hit) {
         switch (g_screen) {
@@ -903,8 +1481,9 @@ void loop()
             case SCR_BROWSE:     handleBrowse(t); break;
             case SCR_SAVED:      handleSaved(t); break;
             case SCR_MORE:       handleMore(t); break;
-            case SCR_DEFINITION: handleDefinition(t); break;
+            case SCR_DEFINITION: break;   // handled above
             case SCR_HISTORY:    handleHistory(t); break;
+            case SCR_DICTS:      handleDicts(t); break;
         }
     }
     delay(10);
